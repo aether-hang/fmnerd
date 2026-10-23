@@ -26,6 +26,13 @@ def add_fmnerd_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--per_channel", type=str2bool, default=True)
     parser.add_argument("--mask_mode", type=str, default="global", choices=["global", "classwise"])
+    parser.add_argument(
+        "--init_mode",
+        type=str,
+        default="kmeans",
+        choices=["kmeans", "real"],
+        help="initialise z_low from K-Means centres or from real images' selected DCT coefficients",
+    )
     parser.add_argument("--lambda_fisher", type=float, default=0.3)
     parser.add_argument(
         "--dipc",

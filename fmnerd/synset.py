@@ -60,6 +60,7 @@ class FMNeRD(nn.Module):
         freq_dim: Optional[int] = None,
         per_channel: bool = True,
         class_wise_mask: bool = False,
+        init_mode: str = "kmeans",
         lambda_fisher: float = 0.3,
         dipc: int = 0,
         dim_hidden: int = 64,
@@ -87,6 +88,9 @@ class FMNeRD(nn.Module):
         self.device = torch.device(device)
         self.per_channel = bool(per_channel)
         self.class_wise_mask = bool(class_wise_mask)
+        self.init_mode = str(init_mode).lower()
+        if self.init_mode not in ("kmeans", "real"):
+            raise ValueError("init_mode must be 'kmeans' or 'real', got {!r}".format(init_mode))
         self.lambda_fisher = float(lambda_fisher)
         self.requested_dipc = int(dipc)
         self.warmup_steps = int(warmup_steps)
@@ -237,7 +241,9 @@ class FMNeRD(nn.Module):
         self.param_codes = used_codes
 
         # Codes + prior ------------------------------------------------------
-        z_low = initialise_codes(per_class_coeffs, dipc, seed=self.seed)
+        z_low = initialise_codes(
+            per_class_coeffs, dipc, seed=self.seed, mode=self.init_mode
+        )
         self.z_low = nn.Parameter(z_low.to(self.device))
         mu, sigma = gaussian_prior_stats(per_class_coeffs)
         self.mu = mu.to(self.device)
@@ -490,12 +496,13 @@ class FMNeRD(nn.Module):
             )
         )
         self._log(
-            "Renderer: hidden={} local={} layers={} | lr_code={:.1e} lr_siren={:.1e}".format(
+            "Renderer: hidden={} local={} layers={} | lr_code={:.1e} lr_siren={:.1e} | init={}".format(
                 self.renderer.dim_hidden,
                 self.renderer.dim_local,
                 self.renderer.num_layers,
                 self.lr_code,
                 self.lr_siren,
+                self.init_mode,
             )
         )
         self._log("=" * 70)
@@ -520,6 +527,7 @@ class FMNeRD(nn.Module):
             "config": {
                 "per_channel": self.per_channel,
                 "class_wise_mask": self.class_wise_mask,
+                "init_mode": self.init_mode,
                 "lambda_fisher": self.lambda_fisher,
                 "lambda_prior": self.lambda_prior,
                 "lambda_res": self.lambda_res,

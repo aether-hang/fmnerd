@@ -115,6 +115,7 @@ def _args(tmp, method):
         freq_dim=6,
         per_channel=True,
         mask_mode="global",
+        init_mode="kmeans",
         lambda_fisher=0.3,
         dipc=1,
         dim_hidden=8,

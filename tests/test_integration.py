@@ -106,6 +106,7 @@ class TestMTTIntegration(unittest.TestCase):
             freq_dim=0,
             per_channel=True,
             mask_mode="global",
+            init_mode="kmeans",
             lambda_fisher=0.3,
             dipc=0,
             dim_hidden=None,

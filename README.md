@@ -63,7 +63,10 @@ x_i = IDCT( scatter(z_i, freq_indices) ) + Delta_i
    调制每个隐藏层：
    `h = sin(ω0·(1+γ)⊙(W h + b) + β)`。首层只吃坐标，`ω0_first=30`。
 3. **零初始化**：FiLM 线性层与输出层全部 `zeros_`。因此第 0 步
-   `ΔI_high ≡ 0`，解码结果严格等于 K-Means 初始化的低频底稿。
+   `ΔI_high ≡ 0`，解码结果严格等于低频底稿。
+
+   代码初始化的默认方式是 K-Means；`--init_mode real` 会改为从每类真实图像中
+   抽取 `DIPC` 张图的选中 DCT 系数，作为 FreD 式真实图像初始化。
 4. **预算**：
    `B = C_num × IPC × C × H × W`
    `B_used = P_renderer + C_num × DIPC × k ≤ B`
@@ -261,6 +264,8 @@ freq_dim=192            # CIFAR-10；128x128 用 3072
 3. 频域掩码默认是 **global**（全数据集共享 Top-k）。`--mask_mode classwise`
    已实现：每类用自己的 EVR + 全局 Fisher 选 Top-k。若你希望 Fisher 也按
    类别 one-vs-rest 重算，需要再改 `frequency.build_frequency_scores`。
+   代码初始化默认是 `--init_mode kmeans`；`--init_mode real` 直接从真实图像
+   采样选中系数，适合和 FreD 的初始化方式做对照。
 4. 渲染器默认在 128px 为 18.1k 参数（3.7% 预算），落在规范建议的 15k–35k
    区间偏下。若想让 SIREN 更强，可增大 `--dim_hidden`（如 96）或层数（5），
    代价是 DIPC 下降。注意 128px 默认用 `D_c=32` 而非规范的 16，是为了落在

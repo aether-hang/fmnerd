@@ -22,6 +22,7 @@ from fmnerd.frequency import (
     build_frequency_scores,
     collect_selected_coefficients,
     collect_spectral_moments,
+    initialise_codes,
     kmeans,
     select_topk_indices,
 )
@@ -116,6 +117,21 @@ class TestFrequency(unittest.TestCase):
         distances = torch.cdist(centers, found).min(1).values
         self.assertTrue(float(distances.max()) < 0.2)
 
+    def test_initialise_codes_from_real_rows(self):
+        torch.manual_seed(0)
+        coeffs = [
+            torch.arange(40, dtype=torch.float32).reshape(10, 4) + 100.0 * c
+            for c in range(3)
+        ]
+        init = initialise_codes(coeffs, 4, seed=7, mode="real")
+        init_again = initialise_codes(coeffs, 4, seed=7, mode="real")
+        self.assertTrue(torch.equal(init, init_again))
+        self.assertEqual(tuple(init.shape), (12, 4))
+        for c, coeff in enumerate(coeffs):
+            rows = {tuple(row.tolist()) for row in coeff}
+            for row in init[c * 4 : (c + 1) * 4]:
+                self.assertIn(tuple(row.tolist()), rows)
+
 
 def _dummy_dataset(num_classes=3, per_class=10, channel=3, size=8):
     torch.manual_seed(1)
@@ -209,6 +225,14 @@ class TestFMNeRD(unittest.TestCase):
         synset, _ = self._make(class_wise_mask=True)
         self.assertEqual(tuple(synset.freq_indices.shape), (3, 12))
         images, labels = synset.get(need_copy=True)
+        self.assertEqual(tuple(images.shape), (6, 3, 8, 8))
+        self.assertTrue(torch.isfinite(images).all())
+
+    def test_real_init_mode(self):
+        synset, logs = self._make(init_mode="real")
+        self.assertEqual(synset.init_mode, "real")
+        self.assertTrue(any("init=real" in line for line in logs))
+        images, _ = synset.get(need_copy=True)
         self.assertEqual(tuple(images.shape), (6, 3, 8, 8))
         self.assertTrue(torch.isfinite(images).all())
 

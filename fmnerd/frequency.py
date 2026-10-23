@@ -271,14 +271,40 @@ def initialise_codes(
     per_class_coeffs: Sequence[torch.Tensor],
     dipc: int,
     seed: int = 0,
+    mode: str = "kmeans",
 ) -> torch.Tensor:
-    """K-Means centres used as the initial low-frequency codes.
+    """Initialise the low-frequency codes.
+
+    Args:
+        per_class_coeffs: selected DCT coefficients for every real sample,
+            grouped by class.  Each tensor has shape ``[N_c, k]``.
+        dipc: number of decoded images per class.
+        seed: deterministic sampling / K-Means seed.
+        mode: ``"kmeans"`` uses K-Means centres; ``"real"`` samples actual
+            real-image coefficients, matching FreD's real-image initialisation.
 
     Returns ``[C_num * dipc, k]`` ordered class-major, matching ``label_syn``.
     """
+    mode = str(mode).lower()
+    if mode not in ("kmeans", "real"):
+        raise ValueError("init mode must be 'kmeans' or 'real', got {!r}".format(mode))
+
     centers = []
     for c, coeff in enumerate(per_class_coeffs):
-        centers.append(kmeans(coeff, dipc, seed=seed + 1000 * c))
+        gen = torch.Generator().manual_seed(seed + 1000 * c)
+        if mode == "kmeans":
+            centers.append(kmeans(coeff, dipc, seed=seed + 1000 * c))
+            continue
+
+        n = int(coeff.shape[0])
+        if n <= 0:
+            raise ValueError("Class {} has no coefficients".format(c))
+        if n >= dipc:
+            indices = torch.randperm(n, generator=gen)[:dipc]
+        else:
+            # Rare under a sane budget; keep the code total rather than fail.
+            indices = torch.randint(n, (dipc,), generator=gen)
+        centers.append(coeff[indices].clone().to(torch.float32))
     return torch.cat(centers, dim=0).to(torch.float32)
 
 

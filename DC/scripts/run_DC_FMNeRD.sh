@@ -16,6 +16,7 @@ batch_syn=0
 freq_dim=192
 dipc=0
 mask_mode="global"
+init_mode="kmeans"
 per_channel="True"
 lambda_fisher=0.3
 warmup_steps=300
@@ -42,6 +43,7 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_DC_FMNeRD.py \
 --freq_dim ${freq_dim} \
 --dipc ${dipc} \
 --mask_mode ${mask_mode} \
+--init_mode ${init_mode} \
 --per_channel ${per_channel} \
 --lambda_fisher ${lambda_fisher} \
 --warmup_steps ${warmup_steps} \

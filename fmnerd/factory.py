@@ -44,6 +44,7 @@ def build_synset(
         freq_dim=args.freq_dim if args.freq_dim > 0 else None,
         per_channel=args.per_channel,
         class_wise_mask=args.mask_mode == "classwise",
+        init_mode=getattr(args, "init_mode", "kmeans"),
         lambda_fisher=args.lambda_fisher,
         dipc=args.dipc,
         dim_hidden=renderer_cfg["dim_hidden"],
