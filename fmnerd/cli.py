@@ -88,6 +88,12 @@ def add_distill_args(
     parser.add_argument("--batch_syn", type=int, default=0)
     parser.add_argument("--dsa", type=str2bool, default=default_dsa)
     parser.add_argument("--dsa_strategy", type=str, default=default_dsa_strategy)
+    parser.add_argument(
+        "--eval_base_only",
+        type=str2bool,
+        default=False,
+        help="diagnostic: evaluate the low-frequency DCT base without the SIREN residual",
+    )
     parser.add_argument("--data_path", type=str, default="../data")
     parser.add_argument("--save_path", type=str, default="./results")
     parser.add_argument("--seed", type=int, default=0)

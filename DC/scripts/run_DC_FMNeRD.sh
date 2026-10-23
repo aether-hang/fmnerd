@@ -24,6 +24,7 @@ lr_code=2e-3
 lr_siren=2e-4
 lambda_prior=0.01
 lambda_res=0.005
+eval_base_only="False"
 
 TAG="val"
 FLAG="${dst}_${ipc}ipc_${net}#DC_FMNeRD_k${freq_dim}_${mask_mode}_w${warmup_steps}#${Iteration}_${lr_code}_${lr_siren}#${TAG}"
@@ -49,4 +50,5 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_DC_FMNeRD.py \
 --warmup_steps ${warmup_steps} \
 --lr_code ${lr_code} --lr_siren ${lr_siren} \
 --lambda_prior ${lambda_prior} --lambda_res ${lambda_res} \
+--eval_base_only ${eval_base_only} \
 --FLAG ${FLAG}

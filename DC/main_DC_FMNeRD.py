@@ -180,12 +180,24 @@ def main(args):
                             "DC augmentation parameters: {}".format(args.dc_aug_param),
                         )
 
+                    if getattr(args, "eval_base_only", False):
+                        save_and_print(
+                            args.log_path,
+                            "Eval mode: base-only (SIREN residual disabled)",
+                        )
                     accs = []
                     for it_eval in range(args.num_eval):
                         net_eval = get_network(
                             model_eval, channel, num_classes, im_size, dist=False
                         ).to(args.device)
-                        image_syn_eval, label_syn_eval = synset.get(need_copy=True)
+                        aux_eval = None
+                        if getattr(args, "eval_base_only", False):
+                            image_syn_eval, label_syn_eval, aux_eval = synset.get(
+                                need_copy=True, return_aux=True
+                            )
+                            image_syn_eval = aux_eval["base"]
+                        else:
+                            image_syn_eval, label_syn_eval = synset.get(need_copy=True)
                         _, _, acc_test = evaluate_synset(
                             it_eval,
                             net_eval,
@@ -196,6 +208,7 @@ def main(args):
                         )
                         accs.append(acc_test)
                         del image_syn_eval, label_syn_eval
+                        del aux_eval
 
                     acc_test_mean = float(np.mean(accs))
                     acc_test_std = float(np.std(accs))
