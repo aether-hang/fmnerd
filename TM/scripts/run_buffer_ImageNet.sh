@@ -11,12 +11,16 @@ buffer_path="../buffers"
 # For the final paper setting use num_experts=100, train_epochs=50.
 num_experts=20
 train_epochs=20
+batch_real=64
+batch_train=64
 
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 CUDA_VISIBLE_DEVICES=${cuda_id} python buffer.py \
 --dataset ${dst} \
 --subset ${subset} \
 --res ${res} \
 --model ${model} \
 --data_path ${data_path} --buffer_path ${buffer_path} \
+--batch_real ${batch_real} --batch_train ${batch_train} \
 --train_epochs ${train_epochs} \
 --num_experts ${num_experts}

@@ -219,6 +219,11 @@ bash run_buffer_ImageNet.sh       # 快速 20 experts × 20 epochs
 bash run_TM_FMNeRD_ImageNet.sh
 ```
 
+> 16 GB 显存下，128×128 + ConvNetD5 的 `batch_real=256` 很容易 OOM。
+> ImageNet 脚本已默认改为 `batch_real=64, batch_train=64`，并设置
+> `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128`。如果 backward 仍然 OOM，
+> 把 DC 的 `batch_syn` 从 0 改成 8 或 4，减少每类参与梯度匹配的合成图数量。
+
 所有可调超参数都在脚本顶部，直接改数值即可：
 
 ```bash

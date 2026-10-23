@@ -10,6 +10,9 @@ eval_mode="S"
 data_path="../data/imagenet/imagenette"
 save_path="./results"
 
+# 128x128 ConvNetD5 needs a smaller real batch on a 16 GB GPU.
+batch_real=64
+batch_train=64
 num_eval=5
 Iteration=2000
 eval_it=1000
@@ -30,6 +33,7 @@ lambda_res=0.0
 TAG="codeonly"
 FLAG="${dst}_${subset}_${res}_${ipc}ipc_${net}#DM_FMNeRD_k${freq_dim}_${mask_mode}_w${warmup_steps}#${Iteration}_${lr_code}_${lr_siren}#${TAG}"
 
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 CUDA_VISIBLE_DEVICES=${cuda_id} python main_DM_FMNeRD.py \
 --dataset ${dst} --subset ${subset} --res ${res} \
 --model ${net} \
@@ -41,6 +45,7 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_DM_FMNeRD.py \
 --eval_it ${eval_it} \
 --epoch_eval_train ${epoch_eval_train} \
 --Iteration ${Iteration} \
+--batch_real ${batch_real} --batch_train ${batch_train} \
 --batch_syn ${batch_syn} \
 --freq_dim ${freq_dim} \
 --dipc ${dipc} \

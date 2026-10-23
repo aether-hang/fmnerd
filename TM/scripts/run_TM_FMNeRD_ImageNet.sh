@@ -11,6 +11,8 @@ data_path="../data/imagenet/imagenette"
 save_path="./results"
 buffer_path="../buffers"
 
+batch_real=64
+batch_train=64
 num_eval=5
 Iteration=15000
 batch_syn=150
@@ -29,6 +31,7 @@ lambda_res=0.005
 TAG="full"
 FLAG="${dst}_${subset}_${res}_${ipc}ipc_${net}#TM_FMNeRD_k${freq_dim}_${mask_mode}_w${warmup_steps}#${Iteration}_${lr_code}_${lr_siren}#${TAG}"
 
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 CUDA_VISIBLE_DEVICES=${cuda_id} python main_TM_FMNeRD.py \
 --dataset ${dst} --subset ${subset} --res ${res} \
 --model ${net} \
@@ -36,6 +39,7 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_TM_FMNeRD.py \
 --sh_file ${sh_file} \
 --eval_mode ${eval_mode} \
 --data_path ${data_path} --save_path ${save_path} --buffer_path ${buffer_path} \
+--batch_real ${batch_real} --batch_train ${batch_train} \
 --num_eval ${num_eval} \
 --Iteration ${Iteration} \
 --batch_syn ${batch_syn} \

@@ -248,6 +248,9 @@ def main(args):
                     if it == args.Iteration:
                         accs_all_exps[model_eval] += [float(a) for a in accs]
 
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             if it in eval_it_pool and (save_this_it or it % 1000 == 0):
                 save_snapshot(
                     synset,
@@ -431,6 +434,9 @@ def main(args):
                 )
                 synset.save(os.path.join(exp_dir, "FM_NeRD_final.pt"))
                 del image_syn, label_syn
+
+            if torch.cuda.is_available() and it % 50 == 0:
+                torch.cuda.empty_cache()
 
     save_and_print(
         args.log_path, "\n==================== Final Results ====================\n"
