@@ -176,17 +176,33 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
                                             transforms.CenterCrop(im_size)])
 
         dst_train = datasets.ImageNet(data_path, split="train", transform=transform) # no augmentation
-        dst_train_dict = {c : torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.equal(dst_train.targets, config.img_net_classes[c])))) for c in range(len(config.img_net_classes))}
-        dst_train = torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.isin(dst_train.targets, config.img_net_classes))))
-        loader_train_dict = {c : torch.utils.data.DataLoader(dst_train_dict[c], batch_size=batch_size, shuffle=True, num_workers=16) for c in range(len(config.img_net_classes))}
+
+        # A full ImageNet-1k root exposes 0..999 targets and is filtered with
+        # the selected WordNet indices.  A ready-made 10-class subset folder
+        # (e.g. Imagenette) exposes 0..num_classes-1 targets, so use all of
+        # its classes instead of the original ImageNet indices.
+        if len(dst_train.classes) == num_classes:
+            selected_classes = list(range(num_classes))
+            save_and_print(
+                args.log_path,
+                "ImageNet subset folder: using all {} classes from {}".format(
+                    num_classes, data_path
+                ),
+            )
+        else:
+            selected_classes = config.img_net_classes
+
+        dst_train_dict = {c : torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.equal(dst_train.targets, selected_classes[c])))) for c in range(len(selected_classes))}
+        dst_train = torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.isin(dst_train.targets, selected_classes))))
+        loader_train_dict = {c : torch.utils.data.DataLoader(dst_train_dict[c], batch_size=batch_size, shuffle=True, num_workers=16) for c in range(len(selected_classes))}
         dst_test = datasets.ImageNet(data_path, split="val", transform=transform)
-        dst_test = torch.utils.data.Subset(dst_test, np.squeeze(np.argwhere(np.isin(dst_test.targets, config.img_net_classes))))
+        dst_test = torch.utils.data.Subset(dst_test, np.squeeze(np.argwhere(np.isin(dst_test.targets, selected_classes))))
 
         # ImageFolder stores targets in ``samples`` and its __getitem__ reads
         # from there, so mutating ``targets`` in place is not sufficient (and
         # torchvision 0.12 stores ``targets`` as a Python list).  Remap through
         # target_transform, which is also picklable for DataLoader workers.
-        original_map = {x: i for i, x in enumerate(config.img_net_classes)}
+        original_map = {x: i for i, x in enumerate(selected_classes)}
         target_transform = partial(_remap_target, mapping=original_map)
         dst_train.dataset.target_transform = target_transform
         dst_test.dataset.target_transform = target_transform
@@ -196,7 +212,7 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
         # must not apply the original-label map a second time.  Keep
         # class_map_inv for callers that want the original ImageNet label.
         class_map = {x: x for x in range(num_classes)}
-        class_map_inv = {i: x for i, x in enumerate(config.img_net_classes)}
+        class_map_inv = {i: x for i, x in enumerate(selected_classes)}
         class_names = None
 
     elif dataset.startswith('CIFAR100'):

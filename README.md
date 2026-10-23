@@ -28,6 +28,7 @@ fmnerd/
 │   ├── hyper_params.py
 │   └── scripts/
 │       ├── run_buffer_cifar10.sh
+│       ├── run_buffer_ImageNet.sh
 │       ├── run_TM_FMNeRD_CIFAR10_val.sh
 │       ├── run_TM_FMNeRD.sh
 │       └── run_TM_FMNeRD_ImageNet.sh
@@ -35,12 +36,14 @@ fmnerd/
 │   ├── main_DC_FMNeRD.py
 │   └── scripts/
 │       ├── run_DC_FMNeRD.sh
-│       └── run_DC_FMNeRD_ImageNet.sh
+│       ├── run_DC_FMNeRD_ImageNet.sh
+│       └── run_DC_FMNeRD_ImageNet_codeonly.sh
 ├── DM/                     # DM 训练入口（分布匹配）
 │   ├── main_DM_FMNeRD.py
 │   └── scripts/
 │       ├── run_DM_FMNeRD.sh
-│       └── run_DM_FMNeRD_ImageNet.sh
+│       ├── run_DM_FMNeRD_ImageNet.sh
+│       └── run_DM_FMNeRD_ImageNet_codeonly.sh
 └── tests/
     ├── test_fmnerd.py            # CPU 单元/烟雾测试
     ├── test_integration.py       # 假数据集 + 假 buffer 的端到端 MTT 测试
@@ -183,12 +186,37 @@ cd ../DM/scripts
 bash run_DM_FMNeRD.sh
 
 # ImageNet-Subset 128x128 IPC=1（k=3072, 15 张/类）
-# 先把脚本里的 data_path 改成你的 ImageNet 根目录
+# 数据已放在 data/imagenet/imagenette，脚本默认 data_path 已指向这里
 cd ../DC/scripts
 bash run_DC_FMNeRD_ImageNet.sh
+bash run_DC_FMNeRD_ImageNet_codeonly.sh   # SIREN residual 消融
 
 cd ../DM/scripts
 bash run_DM_FMNeRD_ImageNet.sh
+bash run_DM_FMNeRD_ImageNet_codeonly.sh
+```
+
+ImageNet-Subset 使用 **Imagenette2-160**（10 类、160×160 原图，训练
+9469 张、验证 3925 张），目录结构为：
+
+```text
+data/imagenet/imagenette/
+├── train/<wnid>/*.JPEG
+├── val/<wnid>/*.JPEG
+└── meta.bin                    # torchvision ImageNet 读取的 10 类元数据
+```
+
+`meta.bin` 是给 `torchvision.datasets.ImageNet` 用的最小 10 类元数据；
+`TM/utils.py` 会检测到这是一个 10 类子集目录，并直接使用它的 `0..9` 标签。
+`data_path` 在 DC/DM/TM 脚本里均设为 `../data/imagenet/imagenette`。
+
+TM 需要先生成 buffer：
+
+```bash
+cd TM/scripts
+bash run_buffer_ImageNet.sh       # 快速 20 experts × 20 epochs
+# 正式实验把脚本里的 num_experts=100, train_epochs=50
+bash run_TM_FMNeRD_ImageNet.sh
 ```
 
 所有可调超参数都在脚本顶部，直接改数值即可：

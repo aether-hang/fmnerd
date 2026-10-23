@@ -403,9 +403,16 @@ def main(args):
 
             loss_avg /= num_classes * args.outer_loop
             if it % 10 == 0:
+                if need_reg:
+                    prior_log = args.lambda_prior * (prior_total / num_classes).item()
+                    residual_log = args.lambda_res * (residual_total / num_classes).item()
+                else:
+                    prior_log = 0.0
+                    residual_log = 0.0
                 save_and_print(
                     args.log_path,
-                    "%s iter = %04d, loss = %.4f" % (get_time(), it, loss_avg),
+                    "%s iter = %04d, loss = %.4f, prior = %.4f, residual = %.4f"
+                    % (get_time(), it, loss_avg, prior_log, residual_log),
                 )
 
             if it == args.Iteration:
