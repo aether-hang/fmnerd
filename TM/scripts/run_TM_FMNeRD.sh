@@ -12,17 +12,18 @@ buffer_path="../buffers"
 num_eval=5
 Iteration=15000
 batch_syn=0
-freq_dim=192
+freq_dim=512
 dipc=0
-mask_mode="global"
-init_mode="kmeans"
+mask_mode="classwise"
+init_mode="real"
 per_channel="True"
-lambda_fisher=0.3
-warmup_steps=300
-lr_code=2e-3
-lr_siren=2e-4
-lambda_prior=0.01
-lambda_res=0.005
+lambda_fisher=0.0
+warmup_steps=0
+lr_code=100
+lr_siren=1e-3
+lambda_prior=0.0
+lambda_res=0.0
+residual_alpha=0.05
 
 TAG=""
 FLAG="${dst}_${ipc}ipc_${net}#TM_FMNeRD_k${freq_dim}_${mask_mode}_w${warmup_steps}#${Iteration}_${lr_code}_${lr_siren}#${TAG}"
@@ -46,4 +47,5 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_TM_FMNeRD.py \
 --warmup_steps ${warmup_steps} \
 --lr_code ${lr_code} --lr_siren ${lr_siren} \
 --lambda_prior ${lambda_prior} --lambda_res ${lambda_res} \
+--residual_alpha ${residual_alpha} \
 --FLAG ${FLAG}

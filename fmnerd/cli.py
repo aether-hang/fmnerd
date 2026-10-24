@@ -21,19 +21,25 @@ def add_fmnerd_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--freq_dim",
         type=int,
-        default=0,
-        help="total DCT coefficients per image (0 = auto, 6.25%% per channel)",
+        default=512,
+        help="total DCT coefficients per image (revised default k=512)",
     )
     parser.add_argument("--per_channel", type=str2bool, default=True)
-    parser.add_argument("--mask_mode", type=str, default="global", choices=["global", "classwise"])
+    parser.add_argument(
+        "--mask_mode",
+        type=str,
+        default="classwise",
+        choices=["global", "classwise"],
+        help="classwise EVR mask is the revised default",
+    )
     parser.add_argument(
         "--init_mode",
         type=str,
-        default="kmeans",
+        default="real",
         choices=["kmeans", "real"],
-        help="initialise z_low from K-Means centres or from real images' selected DCT coefficients",
+        help="initialise z_low from real image coefficients (K-Means kept for legacy only)",
     )
-    parser.add_argument("--lambda_fisher", type=float, default=0.3)
+    parser.add_argument("--lambda_fisher", type=float, default=0.0)
     parser.add_argument(
         "--dipc",
         type=int,
@@ -41,15 +47,19 @@ def add_fmnerd_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="decoded images per class (0 = use the remaining budget automatically)",
     )
     parser.add_argument("--dim_hidden", type=int, default=None)
-    parser.add_argument("--dim_local", type=int, default=16)
+    parser.add_argument(
+        "--dim_local", type=int, default=16,
+        help="hidden width of the global modulation MLP",
+    )
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--w0", type=float, default=30.0)
     parser.add_argument("--w0_first", type=float, default=30.0)
-    parser.add_argument("--warmup_steps", type=int, default=300)
-    parser.add_argument("--lr_code", type=float, default=2e-3)
-    parser.add_argument("--lr_siren", type=float, default=2e-4)
-    parser.add_argument("--lambda_prior", type=float, default=0.01)
-    parser.add_argument("--lambda_res", type=float, default=0.005)
+    parser.add_argument("--residual_alpha", type=float, default=0.05)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--lr_code", type=float, default=100.0)
+    parser.add_argument("--lr_siren", type=float, default=1e-3)
+    parser.add_argument("--lambda_prior", type=float, default=0.0)
+    parser.add_argument("--lambda_res", type=float, default=0.0)
     parser.add_argument("--init_chunk", type=int, default=256)
     parser.add_argument("--decode_chunk", type=int, default=512)
     parser.add_argument(

@@ -56,19 +56,27 @@ LR_TEACHER = {
 }
 
 
-def _renderer_params(channel, dim_hidden, dim_local, num_layers):
-    """Exact parameter count of ``FiLMSirenRenderer`` (kept dependency-free)."""
-    first = 2 * dim_hidden + dim_hidden
-    hidden = (dim_hidden * dim_hidden + dim_hidden) + (
-        dim_local * 2 * dim_hidden + 2 * dim_hidden
+def _renderer_params(channel, code_dim, dim_hidden, dim_local, num_layers):
+    """Exact parameter count of the revised ``FiLMSirenRenderer``.
+
+    The count includes the global modulation MLP, the 5-D SIREN first layer,
+    the hidden layers and the output layer.
+    """
+    modulation = (
+        code_dim * dim_local + dim_local          # Linear(code, mod)
+        + 2 * dim_local                           # LayerNorm
+        + dim_local * 2 * dim_hidden + 2 * dim_hidden  # Linear(mod, 2D)
     )
+    first = (2 + channel) * dim_hidden + dim_hidden
+    hidden = (num_layers - 2) * (dim_hidden * dim_hidden + dim_hidden)
     out = dim_hidden * channel + channel
-    conv = channel * dim_local * 3 * 3 + dim_local
-    return first + (num_layers - 2) * hidden + out + conv
+    return modulation + first + hidden + out
 
 
-# (D_h, D_c, total linear layers), from smallest to largest.
+# (D_h, D_mod, total linear layers), from smallest to largest.
 _RENDERER_CANDIDATES = [
+    (8, 2, 3),
+    (12, 4, 3),
     (16, 4, 3),
     (24, 8, 3),
     (32, 8, 4),
@@ -84,28 +92,25 @@ def default_renderer(
     height,
     width,
     ipc,
+    code_dim=512,
     budget_fraction=0.05,
 ):
-    """Pick the largest renderer that uses at most ~5% of the budget.
+    """Pick the largest revised renderer using at most ~5% of the budget.
 
-    The specification recommends 3-7% of the 491.52k ImageNet IPC=1 budget,
-    which gives 18.1k parameters.  The same fraction is applied to smaller
-    budgets (CIFAR-10 IPC=1, MNIST, ...) so that the shared renderer does not
-    consume a disproportionate share and destroy the sample count.
-
-    Override with ``--dim_hidden`` / ``--dim_local`` / ``--num_layers``.
+    ``code_dim`` is the low-frequency code length k.  Override with
+    ``--dim_hidden`` / ``--dim_local`` / ``--num_layers``.
     """
     budget = num_classes * ipc * channel * height * width
     target = budget_fraction * budget
     chosen = _RENDERER_CANDIDATES[0]
     for candidate in _RENDERER_CANDIDATES:
-        if _renderer_params(channel, *candidate) <= target:
+        if _renderer_params(channel, code_dim, *candidate) <= target:
             chosen = candidate
     return {
         "dim_hidden": chosen[0],
         "dim_local": chosen[1],
         "num_layers": chosen[2],
-        "params": _renderer_params(channel, *chosen),
+        "params": _renderer_params(channel, code_dim, *chosen),
     }
 
 

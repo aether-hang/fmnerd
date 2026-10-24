@@ -52,35 +52,48 @@ class TestDCT(unittest.TestCase):
 
 
 class TestRenderer(unittest.TestCase):
-    def test_zero_residual_at_init(self):
+    def test_small_nonzero_residual_at_init(self):
         torch.manual_seed(0)
-        renderer = FiLMSirenRenderer(3, dim_hidden=8, dim_local=4, num_layers=4)
+        renderer = FiLMSirenRenderer(3, code_dim=10, dim_hidden=8, dim_local=4, num_layers=4)
         coords = torch.rand(5 * 5, 2) * 2 - 1
-        e_local = torch.randn(2, 25, 4)
-        out = renderer(coords, e_local)
+        base = torch.randn(2, 3, 5, 5)
+        z = torch.randn(2, 10)
+        out = renderer(coords, base, z)
         self.assertEqual(tuple(out.shape), (2, 25, 3))
-        self.assertTrue(torch.equal(out, torch.zeros_like(out)))
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertGreater(float(out.abs().max()), 0.0)
+        self.assertLessEqual(float(out.abs().max()), renderer.residual_alpha + 1e-6)
 
     def test_siren_parameter_count(self):
-        renderer = FiLMSirenRenderer(3, dim_hidden=64, dim_local=32, num_layers=4)
-        # first 2*64+64 = 192; two hidden blocks 2*(64*64+64 + 32*128+128);
-        # output 64*3+3; encoder 3*32*3*3+32.
-        expected = 192 + 2 * (4160 + 4224) + 195 + 896
-        self.assertEqual(renderer.num_parameters(), expected)
+        renderer = FiLMSirenRenderer(
+            3, code_dim=20, dim_hidden=64, dim_local=32, num_layers=4
+        )
+        modulation = 20 * 32 + 32 + 2 * 32 + 32 * 128 + 128
+        first = 5 * 64 + 64
+        hidden = 2 * (64 * 64 + 64)
+        out = 64 * 3 + 3
+        self.assertEqual(renderer.num_parameters(), modulation + first + hidden + out)
 
     def test_first_layer_is_sine(self):
         torch.manual_seed(0)
-        renderer = FiLMSirenRenderer(4, dim_hidden=4, dim_local=2, num_layers=3)
+        renderer = FiLMSirenRenderer(
+            4, code_dim=12, dim_hidden=4, dim_local=2, num_layers=3
+        )
         # Remove the hidden block and make the output an identity so that the
         # renderer output exposes the first-layer activation directly.
         renderer.hidden = torch.nn.ModuleList([])
         renderer.out.weight.data = torch.eye(4)
         renderer.out.bias.data.zero_()
         coords = torch.randn(7, 2)
-        e_local = torch.randn(1, 7, 2)
-        out = renderer(coords, e_local)
-        expected = torch.sin(renderer.w0_first * renderer.first(coords))
-        self.assertTrue(torch.allclose(out[0], expected, atol=1e-6))
+        base = torch.zeros(1, 4, 7, 1)
+        z = torch.randn(1, 12)
+        out = renderer(coords, base, z)
+        anchor = base.permute(0, 2, 3, 1).reshape(1, 7, 4).detach()
+        u = torch.cat([coords.unsqueeze(0), anchor], dim=-1)
+        expected = renderer.residual_alpha * torch.tanh(
+            torch.sin(renderer.w0_first * renderer.first(u))
+        )
+        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
 
 
 class TestFrequency(unittest.TestCase):
@@ -108,6 +121,16 @@ class TestFrequency(unittest.TestCase):
 
         coeffs = collect_selected_coefficients(images, labels, idx, 3, mat, mat, chunk_size=9)
         self.assertEqual([tuple(t.shape) for t in coeffs], [(10, 12)] * 3)
+
+    def test_per_channel_non_divisible_k(self):
+        torch.manual_seed(0)
+        scores = torch.randn(3 * 8 * 8)
+        idx = select_topk_indices(scores, 64, True, 3, 8, 8)
+        self.assertEqual(tuple(idx.shape), (64,))
+        counts = torch.bincount(
+            torch.div(idx, 8 * 8, rounding_mode="floor"), minlength=3
+        )
+        self.assertEqual(counts.tolist(), [22, 21, 21])
 
     def test_kmeans(self):
         torch.manual_seed(0)
@@ -158,6 +181,8 @@ class TestFMNeRD(unittest.TestCase):
             dim_local=4,
             num_layers=3,
             warmup_steps=2,
+            lr_code=1e-2,
+            lr_siren=1e-3,
             init_chunk=4,
             decode_chunk=2,
             logger=logs.append,
@@ -180,13 +205,15 @@ class TestFMNeRD(unittest.TestCase):
         self.assertEqual(tuple(labels.shape), (6,))
         self.assertTrue(torch.isfinite(images).all())
 
-        # At step 0 delta is exactly zero: decoded image == IDCT base.
+        # The revised architecture starts with a small, non-zero residual.
         z = synset.z_low.detach()
         flat = torch.zeros(6, 3 * 8 * 8)
         fidx = synset.freq_indices.unsqueeze(0).expand(6, -1)
         flat.scatter_(1, fidx, z)
         base = idct_2d(flat.view(6, 3, 8, 8), synset.mat_h, synset.mat_w)
-        self.assertTrue(torch.allclose(images, base, atol=1e-6))
+        self.assertLessEqual(
+            float((images - base).abs().max()), synset.residual_alpha + 1e-6
+        )
 
         small, _ = synset.get(need_copy=True, indices=[0, 3])
         self.assertEqual(tuple(small.shape), (2, 3, 8, 8))
@@ -197,7 +224,7 @@ class TestFMNeRD(unittest.TestCase):
         prior, residual = synset.regularization(aux, aux["labels"])
         self.assertGreaterEqual(float(prior), 0.0)
         self.assertGreaterEqual(float(residual), 0.0)
-        self.assertAlmostEqual(float(residual), 0.0, places=6)
+        self.assertGreater(float(residual), 0.0)
 
         loss = prior + residual + aux["base"].pow(2).mean() + (aux["base"] + aux["delta"]).mean()
         loss.backward()
@@ -205,6 +232,14 @@ class TestFMNeRD(unittest.TestCase):
         self.assertGreater(float(synset.z_low.grad.abs().sum()), 0.0)
         self.assertIsNotNone(synset.renderer.out.weight.grad)
         self.assertGreater(float(synset.renderer.out.weight.grad.abs().sum()), 0.0)
+        # No zero-init deadlock: hidden SIREN and the global MLP also receive
+        # gradients on the first backward pass.
+        self.assertGreater(
+            float(synset.renderer.hidden[0].siren.linear.weight.grad.abs().sum()), 0.0
+        )
+        self.assertGreater(
+            float(synset.renderer.modulation.net[0].weight.grad.abs().sum()), 0.0
+        )
 
         synset.optim_step()
         synset.optim_zero_grad()

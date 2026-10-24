@@ -1,16 +1,17 @@
 """FM-NeRD: Frequency-Modulated Neural Representation Distillation.
 
-The synthetic image is ``x = IDCT(z_low) + delta``:
+The revised synthetic image is ``x = IDCT(z_low) + alpha * delta``:
 
-* ``z_low`` are the Top-k orthonormal 2D-DCT coefficients, i.e. the compact
-  low-frequency canvas inherited from FreD;
-* ``delta`` is rendered by one *shared* conditional SIREN for the whole
-  dataset, conditioned at every pixel on local features of the low-frequency
-  canvas (DDiF-style neural field, FiLM-modulated).
+* ``z_low`` are the Top-k orthonormal 2D-DCT coefficients, initialised from
+  randomly selected *real images* (not means or K-Means);
+* ``delta`` is produced by one shared 5-D SIREN.  Its input is
+  ``[x, y, R_base, G_base, B_base]`` and its per-sample hidden modulation
+  ``(gamma, beta)`` comes from a global MLP applied to ``z_low``;
+* the output is ``0.05 * tanh(...)`` with a small non-zero random output
+  layer, avoiding the old zero-initialisation gradient deadlock.
 
 All learnable parameters are ``z_low`` and the renderer; the DCT matrices,
-frequency indices and Gaussian prior statistics are buffers and cost no
-storage budget.
+frequency indices and prior statistics are buffers and cost no storage budget.
 """
 
 from __future__ import annotations
@@ -35,18 +36,6 @@ from .frequency import (
 from .renderer import FiLMSirenRenderer
 
 
-def _default_freq_dim_per_channel(height: int, width: int = None) -> int:
-    """Keep ~6.25% of the spectrum per channel (FreD's 32x32 operating point).
-
-    For 32x32 this is 64 coefficients, for 64x64 it is 256 and for 128x128 it
-    is 1024.  The value is only a starting point and can be overridden with
-    ``--freq_dim`` (total over all channels).
-    """
-    if width is None:
-        width = height
-    return max(1, (height * width) // 16)
-
-
 class FMNeRD(nn.Module):
     """Synthetic dataset parameterised by frequency codes + shared SIREN."""
 
@@ -57,22 +46,23 @@ class FMNeRD(nn.Module):
         im_size: Tuple[int, int],
         ipc: int,
         device: str = "cuda",
-        freq_dim: Optional[int] = None,
+        freq_dim: Optional[int] = 512,
         per_channel: bool = True,
         class_wise_mask: bool = False,
-        init_mode: str = "kmeans",
-        lambda_fisher: float = 0.3,
+        init_mode: str = "real",
+        lambda_fisher: float = 0.0,
         dipc: int = 0,
         dim_hidden: int = 64,
         dim_local: int = 16,
         num_layers: int = 4,
         w0: float = 30.0,
         w0_first: float = 30.0,
-        warmup_steps: int = 300,
-        lr_code: float = 2e-3,
-        lr_siren: float = 2e-4,
-        lambda_prior: float = 0.01,
-        lambda_res: float = 0.005,
+        residual_alpha: float = 0.05,
+        warmup_steps: int = 0,
+        lr_code: float = 100.0,
+        lr_siren: float = 1e-3,
+        lambda_prior: float = 0.0,
+        lambda_res: float = 0.0,
         init_chunk: int = 256,
         decode_chunk: int = 512,
         seed: int = 0,
@@ -98,26 +88,31 @@ class FMNeRD(nn.Module):
         self.lr_siren = float(lr_siren)
         self.lambda_prior = float(lambda_prior)
         self.lambda_res = float(lambda_res)
+        self.residual_alpha = float(residual_alpha)
         self.init_chunk = int(init_chunk)
         self.decode_chunk = int(decode_chunk)
         self.seed = int(seed)
         self.logger = logger if logger is not None else print
 
-        self.freq_dim = int(freq_dim) if freq_dim else 0
+        # k is known before building the modulation MLP.  ``0``/``None`` use
+        # the revised default k=512 rather than the old per-resolution default.
+        self.freq_dim = int(freq_dim) if freq_dim and int(freq_dim) > 0 else 512
         self._grid_cache = {}
         mat_h = build_dct_matrix(self.im_size[0], device=self.device)
         mat_w = build_dct_matrix(self.im_size[1], device=self.device)
         self.register_buffer("mat_h", mat_h)
         self.register_buffer("mat_w", mat_w)
 
-        # Global shared renderer.
+        # Global shared renderer.  The modulation MLP consumes the k-D code.
         self.renderer = FiLMSirenRenderer(
             channel=self.channel,
+            code_dim=self.freq_dim,
             dim_hidden=dim_hidden,
             dim_local=dim_local,
             num_layers=num_layers,
             w0_first=w0_first,
             w0=w0,
+            residual_alpha=self.residual_alpha,
         ).to(self.device)
 
         # Populated by initialize_from_dataset().
@@ -126,7 +121,8 @@ class FMNeRD(nn.Module):
         self.register_buffer("sigma", torch.ones(self.num_classes, 0))
         self.register_buffer("label_syn", torch.zeros(0, dtype=torch.long))
         self.z_low: Optional[nn.Parameter] = None
-        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.optimizer_code: Optional[torch.optim.Optimizer] = None
+        self.optimizer_siren: Optional[torch.optim.Optimizer] = None
         self.num_per_class = int(dipc) if dipc > 0 else 0
         self.num_total = self.num_classes * self.num_per_class
         self.initialized = False
@@ -140,7 +136,7 @@ class FMNeRD(nn.Module):
         labels: torch.Tensor,
         save_dir: Optional[str] = None,
     ) -> None:
-        """Run the DFM construction, K-Means initialisation and prior fitting.
+        """Run the DFM construction, code initialisation and prior fitting.
 
         Args:
             images: CPU tensor ``[N, C, H, W]`` of *normalised* real images.
@@ -178,9 +174,6 @@ class FMNeRD(nn.Module):
             class_wise=self.class_wise_mask,
         )
 
-        if self.freq_dim <= 0:
-            k_per_channel = _default_freq_dim_per_channel(*self.im_size)
-            self.freq_dim = self.channel * k_per_channel
         freq_indices = select_topk_indices(
             scores,
             freq_dim=self.freq_dim,
@@ -192,11 +185,17 @@ class FMNeRD(nn.Module):
         self.freq_indices = freq_indices.to(self.device)
         k = int(freq_indices.shape[-1])
         self.freq_dim = k
+        if k != self.renderer.code_dim:
+            raise ValueError(
+                "Renderer was built for code_dim={} but the mask selected k={}".format(
+                    self.renderer.code_dim, k
+                )
+            )
         self._log(
-            "DFM: k={} coefficients/image ({} per channel) | class-wise={} | "
-            "lambda_Fisher={:.2f}".format(
+            "DFM: k={} coefficients/image (~{:.1f} per channel) | class-wise={} | "
+            "EVR/Fisher mix={:.2f}".format(
                 k,
-                k // self.channel if k % self.channel == 0 else -1,
+                k / self.channel,
                 self.class_wise_mask,
                 self.lambda_fisher,
             )
@@ -252,11 +251,13 @@ class FMNeRD(nn.Module):
             dipc
         )
 
-        self.optimizer = torch.optim.Adam(
-            [
-                {"params": [self.z_low], "lr": self.lr_code, "weight_decay": 0.0},
-                {"params": list(self.renderer.parameters()), "lr": self.lr_siren, "weight_decay": 0.0},
-            ]
+        # Deliberately decoupled optimisers: FreD/MTT-style SGD for the
+        # low-frequency codes, Adam for the shared SIREN/modulation network.
+        self.optimizer_code = torch.optim.SGD(
+            [self.z_low], lr=self.lr_code, momentum=0.5
+        )
+        self.optimizer_siren = torch.optim.Adam(
+            self.renderer.parameters(), lr=self.lr_siren
         )
 
         self.initialized = True
@@ -326,22 +327,13 @@ class FMNeRD(nn.Module):
 
         if native:
             base_out = base
-            e_local = self.renderer.encode_local(base)
         else:
             grid_b = grid.unsqueeze(0).expand(batch, -1, -1, -1)
             base_out = F.grid_sample(
                 base, grid_b, mode="bilinear", padding_mode="border", align_corners=True
             )
-            e_map = self.renderer.encode_local(base)
-            e_map = F.grid_sample(
-                e_map, grid_b, mode="bilinear", padding_mode="border", align_corners=True
-            )
-            e_local = e_map
 
-        e_local = e_local.permute(0, 2, 3, 1).reshape(
-            batch, height * width, self.renderer.dim_local
-        )
-        delta = self.renderer(coords, e_local)
+        delta = self.renderer(coords, base_out, z)
         delta = delta.view(batch, height, width, self.channel).permute(0, 3, 1, 2)
         images = base_out + delta
 
@@ -461,12 +453,16 @@ class FMNeRD(nn.Module):
                 )
 
     def optim_zero_grad(self) -> None:
-        if self.optimizer is not None:
-            self.optimizer.zero_grad(set_to_none=True)
+        if self.optimizer_code is not None:
+            self.optimizer_code.zero_grad(set_to_none=True)
+        if self.optimizer_siren is not None:
+            self.optimizer_siren.zero_grad(set_to_none=True)
 
     def optim_step(self) -> None:
-        if self.optimizer is not None:
-            self.optimizer.step()
+        if self.optimizer_code is not None:
+            self.optimizer_code.step()
+        if self.optimizer_siren is not None:
+            self.optimizer_siren.step()
 
     # ------------------------------------------------------------------
     # Bookkeeping / persistence
@@ -496,10 +492,12 @@ class FMNeRD(nn.Module):
             )
         )
         self._log(
-            "Renderer: hidden={} local={} layers={} | lr_code={:.1e} lr_siren={:.1e} | init={}".format(
+            "Renderer: hidden={} mod={} layers={} alpha={:.3f} | "
+            "SGD(lr_code={:.1e}, mom=0.5) Adam(lr_siren={:.1e}) | init={}".format(
                 self.renderer.dim_hidden,
                 self.renderer.dim_local,
                 self.renderer.num_layers,
+                self.renderer.residual_alpha,
                 self.lr_code,
                 self.lr_siren,
                 self.init_mode,
@@ -531,6 +529,7 @@ class FMNeRD(nn.Module):
                 "lambda_fisher": self.lambda_fisher,
                 "lambda_prior": self.lambda_prior,
                 "lambda_res": self.lambda_res,
+                "residual_alpha": self.residual_alpha,
                 "warmup_steps": self.warmup_steps,
                 "lr_code": self.lr_code,
                 "lr_siren": self.lr_siren,

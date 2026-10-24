@@ -38,8 +38,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 def build_synset(args, channel, im_size, num_classes):
     if args.dim_hidden is None:
+        code_dim = args.freq_dim if args.freq_dim > 0 else 512
         renderer_cfg = default_renderer(
-            channel, num_classes, im_size[0], im_size[1], args.ipc
+            channel, num_classes, im_size[0], im_size[1], args.ipc,
+            code_dim=code_dim,
         )
     else:
         renderer_cfg = {
@@ -57,6 +59,7 @@ def build_synset(args, channel, im_size, num_classes):
         freq_dim=args.freq_dim if args.freq_dim > 0 else None,
         per_channel=args.per_channel,
         class_wise_mask=args.mask_mode == "classwise",
+        init_mode=getattr(args, "init_mode", "real"),
         lambda_fisher=args.lambda_fisher,
         dipc=args.dipc,
         dim_hidden=renderer_cfg["dim_hidden"],
@@ -64,6 +67,7 @@ def build_synset(args, channel, im_size, num_classes):
         num_layers=renderer_cfg["num_layers"],
         w0=args.w0,
         w0_first=args.w0_first,
+        residual_alpha=getattr(args, "residual_alpha", 0.05),
         warmup_steps=args.warmup_steps,
         lr_code=args.lr_code,
         lr_siren=args.lr_siren,
@@ -574,21 +578,23 @@ if __name__ == "__main__":
     parser.add_argument("--batch_syn", type=int, default=0)
 
     # FM-NeRD
-    parser.add_argument("--freq_dim", type=int, default=0, help="total DCT coefficients per image (0 = auto)")
+    parser.add_argument("--freq_dim", type=int, default=512, help="total DCT coefficients per image (default k=512)")
     parser.add_argument("--per_channel", type=str2bool, default=True)
-    parser.add_argument("--mask_mode", type=str, default="global", choices=["global", "classwise"])
-    parser.add_argument("--lambda_fisher", type=float, default=0.3)
+    parser.add_argument("--mask_mode", type=str, default="classwise", choices=["global", "classwise"])
+    parser.add_argument("--init_mode", type=str, default="real", choices=["kmeans", "real"])
+    parser.add_argument("--lambda_fisher", type=float, default=0.0)
     parser.add_argument("--dipc", type=int, default=0, help="decoded images per class (0 = use full budget)")
     parser.add_argument("--dim_hidden", type=int, default=None)
-    parser.add_argument("--dim_local", type=int, default=16)
+    parser.add_argument("--dim_local", type=int, default=16, help="global modulation MLP hidden width")
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--w0", type=float, default=30.0)
     parser.add_argument("--w0_first", type=float, default=30.0)
-    parser.add_argument("--warmup_steps", type=int, default=300)
-    parser.add_argument("--lr_code", type=float, default=2e-3)
-    parser.add_argument("--lr_siren", type=float, default=2e-4)
-    parser.add_argument("--lambda_prior", type=float, default=0.01)
-    parser.add_argument("--lambda_res", type=float, default=0.005)
+    parser.add_argument("--residual_alpha", type=float, default=0.05)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--lr_code", type=float, default=100.0)
+    parser.add_argument("--lr_siren", type=float, default=1e-3)
+    parser.add_argument("--lambda_prior", type=float, default=0.0)
+    parser.add_argument("--lambda_res", type=float, default=0.0)
     parser.add_argument("--init_chunk", type=int, default=256)
     parser.add_argument("--decode_chunk", type=int, default=512)
 

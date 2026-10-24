@@ -17,18 +17,19 @@ num_eval=5
 Iteration=1000
 eval_it=1000
 epoch_eval_train=300
-batch_syn=0
-freq_dim=3072
+batch_syn=8
+freq_dim=512
 dipc=0
-mask_mode="global"
+mask_mode="classwise"
 init_mode="real"
 per_channel="True"
-lambda_fisher=0.3
+lambda_fisher=0.0
 warmup_steps=0
-lr_code=1e-2
+lr_code=100
 lr_siren=0
 lambda_prior=0.0
 lambda_res=0.0
+residual_alpha=0.0
 
 TAG="codeonly"
 FLAG="${dst}_${subset}_${res}_${ipc}ipc_${net}#DC_FMNeRD_k${freq_dim}_${mask_mode}_w${warmup_steps}#${Iteration}_${lr_code}_${lr_siren}#${TAG}"
@@ -56,4 +57,5 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_DC_FMNeRD.py \
 --warmup_steps ${warmup_steps} \
 --lr_code ${lr_code} --lr_siren ${lr_siren} \
 --lambda_prior ${lambda_prior} --lambda_res ${lambda_res} \
+--residual_alpha ${residual_alpha} \
 --FLAG ${FLAG}

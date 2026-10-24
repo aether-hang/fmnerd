@@ -7,7 +7,7 @@ Everything in this file is executed exactly once, before distillation starts:
 2. construction of the mixed EVR + Fisher score and selection of the Top-k
    frequency dimensions;
 3. a second pass that gathers the selected coefficients, which are used for
-   the per-class Gaussian prior and for K-Means initialisation of ``z_low``.
+   the per-class prior and for real-image initialisation of ``z_low``.
 
 The second pass is cheaper than keeping the whole frequency matrix in memory
 (``N x C x H x W``), which matters for 128x128 subsets.
@@ -179,17 +179,18 @@ def select_topk_indices(
     view = scores.reshape(*(lead + (channel, hw)))
 
     if per_channel:
-        if freq_dim % channel != 0:
-            raise ValueError(
-                "per_channel=True requires freq_dim divisible by channel; "
-                "got freq_dim={} channel={}".format(freq_dim, channel)
-            )
-        k_per_channel = freq_dim // channel
-        idx = torch.topk(view, k_per_channel, dim=-1).indices       # [..., C, k]
-        offsets = (torch.arange(channel, device=scores.device) * hw).view(
-            *([1] * len(lead)), channel, 1
-        )
-        flat = (idx + offsets).reshape(*(lead + (freq_dim,)))
+        # Allocate an almost equal quota per channel.  This also supports
+        # k=512 on RGB data, where a strict equal split is impossible.
+        base = freq_dim // channel
+        remainder = freq_dim % channel
+        channel_indices = []
+        for ch in range(channel):
+            kc = base + (1 if ch < remainder else 0)
+            if kc == 0:
+                continue
+            idx = torch.topk(view[..., ch, :], kc, dim=-1).indices
+            channel_indices.append(idx + ch * hw)
+        flat = torch.cat(channel_indices, dim=-1)
     else:
         flat = torch.topk(scores, freq_dim, dim=-1).indices
 
@@ -271,7 +272,7 @@ def initialise_codes(
     per_class_coeffs: Sequence[torch.Tensor],
     dipc: int,
     seed: int = 0,
-    mode: str = "kmeans",
+    mode: str = "real",
 ) -> torch.Tensor:
     """Initialise the low-frequency codes.
 
@@ -279,7 +280,7 @@ def initialise_codes(
         per_class_coeffs: selected DCT coefficients for every real sample,
             grouped by class.  Each tensor has shape ``[N_c, k]``.
         dipc: number of decoded images per class.
-        seed: deterministic sampling / K-Means seed.
+        seed: deterministic sampling / initialisation seed.
         mode: ``"kmeans"`` uses K-Means centres; ``"real"`` samples actual
             real-image coefficients, matching FreD's real-image initialisation.
 

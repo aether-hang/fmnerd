@@ -16,8 +16,11 @@ def renderer_config(
 ) -> dict:
     """Resolve the renderer size, either explicitly or budget-aware."""
     if args.dim_hidden is None:
+        code_dim = getattr(args, "freq_dim", 512)
+        code_dim = int(code_dim) if code_dim and int(code_dim) > 0 else 512
         return default_renderer_fn(
-            channel, num_classes, im_size[0], im_size[1], args.ipc
+            channel, num_classes, im_size[0], im_size[1], args.ipc,
+            code_dim=code_dim,
         )
     return {
         "dim_hidden": args.dim_hidden,
@@ -44,7 +47,7 @@ def build_synset(
         freq_dim=args.freq_dim if args.freq_dim > 0 else None,
         per_channel=args.per_channel,
         class_wise_mask=args.mask_mode == "classwise",
-        init_mode=getattr(args, "init_mode", "kmeans"),
+        init_mode=getattr(args, "init_mode", "real"),
         lambda_fisher=args.lambda_fisher,
         dipc=args.dipc,
         dim_hidden=renderer_cfg["dim_hidden"],
@@ -52,6 +55,7 @@ def build_synset(
         num_layers=renderer_cfg["num_layers"],
         w0=args.w0,
         w0_first=args.w0_first,
+        residual_alpha=getattr(args, "residual_alpha", 0.05),
         warmup_steps=args.warmup_steps,
         lr_code=args.lr_code,
         lr_siren=args.lr_siren,
