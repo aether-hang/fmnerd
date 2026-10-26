@@ -9,10 +9,10 @@ sh_file="run_DM_FMNeRD_ImageNet.sh"
 data_path="../data/imagenet/imagenette"
 save_path="../logs"
 
-msz_per_channel=64
-batch_syn=8          # decoded images per class used by DM each iteration
-Iteration=20000
-eval_it=2000
+msz_per_channel=${MSZ:-64}
+batch_syn=${BATCH_SYN:-8          # decoded images per class used by DM each iteration}
+Iteration=${ITERATION:-20000}
+eval_it=${EVAL_IT:-2000}
 
 CUDA_VISIBLE_DEVICES=${cuda_id} python main_DM_FMNeRD.py \
 --dataset ${dst} --subset ${subset} --res ${res} \

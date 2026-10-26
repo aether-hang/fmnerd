@@ -18,6 +18,14 @@ bash scripts/run_cifar100.sh DM
 bash scripts/run_buffer_imagenet_nette.sh
 bash scripts/run_imagenet_nette.sh TM
 bash scripts/run_imagenet_woof.sh DC
+
+# 也可以直接使用各方法目录下的数据集脚本（T4 profile，单卡/进程）
+bash TM/scripts/run_TM_FMNeRD_ImageNet_nette.sh
+bash DM/scripts/run_DM_FMNeRD_ImageNet_woof.sh
+bash DC/scripts/run_DC_FMNeRD_CIFAR100.sh
+
+# 两张 T4 并行：TM 用 GPU0，DM 用 GPU1
+bash scripts/run_2xT4_pair.sh ImageNet nette
 ```
 
 推荐超参数、IPC 自动配置和消融命令见

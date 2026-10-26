@@ -203,6 +203,37 @@ bash scripts/run_imagenet_nette.sh TM
 
 ---
 
+## 3.3 各方法 × 数据集直接运行脚本（T4 16GB）
+
+每个脚本单独占一张 T4；脚本里 `CUDA_ID` 可覆盖。默认 TM→GPU0、DM→GPU1，
+这样两张卡可以并行跑两个方法。
+
+| 数据集 | TM | DM | DC |
+|---|---|---|---|
+| CIFAR-10 | `TM/scripts/run_TM_FMNeRD_CIFAR10.sh` | `DM/scripts/run_DM_FMNeRD_CIFAR10.sh` | `DC/scripts/run_DC_FMNeRD_CIFAR10.sh` |
+| CIFAR-100 | `TM/scripts/run_TM_FMNeRD_CIFAR100.sh` | `DM/scripts/run_DM_FMNeRD_CIFAR100.sh` | `DC/scripts/run_DC_FMNeRD_CIFAR100.sh` |
+| ImageNet-Nette | `TM/scripts/run_TM_FMNeRD_ImageNet_nette.sh` | `DM/scripts/run_DM_FMNeRD_ImageNet_nette.sh` | `DC/scripts/run_DC_FMNeRD_ImageNet_nette.sh` |
+| ImageNet-Woof | `TM/scripts/run_TM_FMNeRD_ImageNet_woof.sh` | `DM/scripts/run_DM_FMNeRD_ImageNet_woof.sh` | `DC/scripts/run_DC_FMNeRD_ImageNet_woof.sh` |
+
+TM 脚本在 buffer 不存在时会自动调用对应 `run_buffer_*.sh` 先生成 buffer。
+ImageNet 的 T4 profile 使用 `batch_real/train=64`、TM `batch_syn=64`、
+DM/DC `batch_syn=4`；如果仍然 OOM，把 `batch_syn` 再减半。
+
+两张 T4 并行跑 TM + DM：
+
+```bash
+bash scripts/run_2xT4_pair.sh CIFAR10
+bash scripts/run_2xT4_pair.sh CIFAR100
+bash scripts/run_2xT4_pair.sh ImageNet nette
+RUN_DC=1 bash scripts/run_2xT4_pair.sh ImageNet woof
+```
+
+> 当前训练代码本身是单卡训练；上面的 pair 脚本是让两个独立进程分别占用
+> GPU0/GPU1，不是 DDP。单个脚本不要传 `CUDA_VISIBLE_DEVICES=0,1`，
+> 否则只会用第一张卡。
+
+---
+
 ## 4. 常用覆盖方式
 
 ```bash

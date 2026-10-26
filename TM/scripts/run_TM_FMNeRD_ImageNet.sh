@@ -15,10 +15,10 @@ save_path="../logs"
 # FreD's ImageNet IPC=1 budget uses 2048 coefficients/channel, which makes
 # V_c (k -> 20) far larger than the class budget.  k=192 (64/channel) is the
 # default compromise; increase --msz_per_channel for the FreD budget setting.
-msz_per_channel=64
-batch_syn=102
-Iteration=15000
-eval_it=500
+msz_per_channel=${MSZ:-64}
+batch_syn=${BATCH_SYN:-102}
+Iteration=${ITERATION:-15000}
+eval_it=${EVAL_IT:-500}
 
 CUDA_VISIBLE_DEVICES=${cuda_id} python main_TM_FMNeRD.py \
 --dataset ${dst} --subset ${subset} --res ${res} \
