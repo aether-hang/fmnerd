@@ -77,19 +77,21 @@ z_i    = ( DCT(x_i)[M_c] - mu_c ) / max(s_c, code_std_floor)
   SIREN 的频谱能力严重偏低，Stage 2 很难生成高频细节，表现为合成图像
   “模糊、笼统”。做对照实验时请把 `sqrt6` 只当作消融项。
 
-### 1.4 每类调制映射 `V_c` 与 shift
+### 1.4 每类调制映射 `V_c` 与逐坐标空间基
 
-对每个受调制层 `l`（宽度 `d_l`）：
+对每个受调制层 `l`（宽度 `d_l`）和坐标 `c`：
 
 ```text
-phi_i^(l) = V_c^(l) f_i
-h^(l+1)  = sin( w0 * ( W^(l) h^(l) + b^(l) + phi_i^(l) ) )
+phi_i^(l)(c) = Phi_{c,l}(c) ⊙ ( V_c^(l) f_i )
+h^(l+1)      = sin( w0 * ( W^(l) h^(l) + b^(l) + phi_i^(l)(c) ) )
 ```
 
-- `V_c^(l) ∈ R^{d_l × k}`，`bias=False`；
-- 高斯初始化 `std=1e-4`（`--vc_init_std`），训练初期调制近似为零；
-- `--vc_shared True` 时所有类共享同一个 `V`（只做全局共享，不加类偏置）；
-- 实现位置：`fmnerd/renderer.py::ShiftModulationBank`。
+- `V_c^(l) ∈ R^{d_l × k}`，`bias=False`，`std=1e-4` 初始化；
+- `Phi_{c,l}` 每类共享一个两层 SIREN trunk（宽度 `--basis_width 8`），
+  每个受调制层一个线性头，输出 `d_l` 维；
+- `--use_spatial_basis False` 时退回旧的全局移位调制，用于消融；
+- `--vc_shared True` 时所有类共享 `V`，但 `Phi` 仍按类定义；
+- 实现位置：`fmnerd/renderer.py::SpatialBasisBank` 与 `FMNeRDRenderer`。
 
 ### 1.5 输出端 top-k DCT 频率对齐损失
 
@@ -101,10 +103,9 @@ pred_i = ( DCT(x_hat_i)[M_c] - mu_c ) / max(s_c, code_std_floor)
 L_freq = 1/(N k) Σ_i Σ_{j=1..k} ( pred_i[j] - z_i[j] )^2
 ```
 
-- `code_mode=residual` 使用 signed residual（保留符号）；
-- `code_mode=absolute` 仍按任务书使用 `|DCT|` 与 `|f|`；
+- 现在**始终对齐完整带符号 DCT 系数**，不再使用 `|DCT|`；
 - 对齐目标是 `z_i.detach()`，避免频率码通过 L_freq 自我塌缩；
-- `lambda_freq(t)` 从 `0.01` 线性 warm-up 到 `0.1`，默认 `1000` 步；
+- `lambda_freq(t)` 从 `0.01` 线性 warm-up 到 `0.1`，默认 `1500` 步；
 - `--use_freq_loss False` 时 `lambda_freq = 0`。
 
 ### 1.6 多样性正则
@@ -112,11 +113,22 @@ L_freq = 1/(N k) Σ_i Σ_{j=1..k} ( pred_i[j] - z_i[j] )^2
 使用更温和的方差下限形式：
 
 ```text
-L_div = mean_l mean_c mean_d  relu( tau - Var_{i∈c}( phi_i^(l)[d] ) )
+L_div = mean_l mean_c mean_d relu(
+          tau - mean_c Var_{i∈c}( phi_i^(l)(c,d) ) )
 tau = 1e-4,  lambda_div = 1e-3
 ```
 
-`--use_div_loss False` 时关闭。
+逐坐标调制时，先对每个通道 `d` 计算 `Var_i(Phi(c,d) v_i(d))`，再对坐标
+和通道平均。`--use_div_loss False` 时关闭。
+
+新增锚定正则：
+
+```text
+L_anchor = mean((f_i - f_i_init)^2)
+lambda_anchor: 1e-2 → 1e-4, 前 3000 步线性衰减
+```
+
+`--use_anchor_loss False` 时关闭。
 
 ---
 
@@ -124,7 +136,9 @@ tau = 1e-4,  lambda_div = 1e-3
 
 ### Stage 1：共享 SIREN 的类均值 warm-up
 
-- 目标图像：空间域类均值 `\bar{x}_c`（任务允许的简化方案）；
+- 目标图像：默认 `--stage1_target spatial_avg`，每个类随机取 `m=8` 个真实实例
+  的平均图；`--stage1_target representative` 则取离类中心最近的真实实例；
+- 不再使用 `IDCT(mean_freq_code)` 作为目标；
 - 不使用任何调制，只优化 `F_{\psi_c}`；
 - 每类 MSE 相加后取平均；
 - Adam，默认 `lr=5e-4`，cosine decay，`--stage1_steps 2000`（ImageNet 脚本用 3000）；
@@ -141,10 +155,11 @@ tau = 1e-4,  lambda_div = 1e-3
 
 ```text
 L = L_DD + lambda_freq(t) * L_freq + lambda_div * L_div
+      + lambda_anchor(t) * L_anchor
 ```
 
 - `L_DD`：TM / DM / DC 原样复用 DDiF 的实现；
-- `f_i` 与 `V_c`：Adam，默认 `lr=5e-4`；
+- `f_i`、`V_c`、`Phi`：Adam，默认 `lr=5e-4`；
 - 共享 SIREN：Adam，默认 `lr=1e-4`；
 - 在总步数后 `1/3`，共享 SIREN 的学习率再乘 `0.1`（`--lr_siren_late_scale`）；
 - `--stage1_only True`：Stage 2 仍运行 DDiF 损失，但调制强制为零、`f_i` 与 `V_c`
@@ -234,7 +249,11 @@ used    = num_classes * P_SIREN
 |---|---|---|
 | `--use_freq_loss {True,False}` | `True` | 关闭时 `lambda_freq=0` |
 | `--use_div_loss {True,False}` | `True` | 关闭时 `lambda_div=0` |
-| `--stage1_only {True,False}` | `False` | Stage 2 调制置零、`f` 与 `V` 冻结 |
+| `--stage1_only {True,False}` | `False` | Stage 2 调制置零、`f`/`V`/`Phi` 冻结 |
+| `--use_spatial_basis {True,False}` | `True` | 逐坐标低秩调制；False 退回全局移位 |
+| `--basis_width` | `8` | `Phi` 的 SIREN trunk 宽度 |
+| `--stage1_target {spatial_avg,representative}` | `spatial_avg` | Stage 1 目标类型 |
+| `--use_anchor_loss {True,False}` | `True` | 频率码锚定正则 |
 | `--vc_shared {True,False}` | `False` | 所有类共享一个 `V` |
 | `--msz_per_channel` / `--k` | `64` / `None` | 控制每实例频率码维度；`k` 必须是通道数整数倍 |
 | `--num_shared_layers` / `--num_cond_layers` | `2` / `2` | SIREN 分割点（总层数含输出层） |
@@ -244,7 +263,8 @@ used    = num_classes * P_SIREN
 辅助超参：`--lambda_freq_start/target`、`--freq_warmup`、
 `--lambda_div`、`--div_tau`、`--lr_code`、`--lr_siren`、
 `--lr_siren_late_scale`、`--code_init_scale`、`--modulation_code_scale`、
-`--vc_init_std`。
+`--vc_init_std`、`--lambda_anchor_start/target`、`--anchor_decay_steps`、
+`--stage1_sample_size`。
 
 示例：
 
@@ -347,24 +367,29 @@ imgs/*.png
 文本日志覆盖任务要求的全部诊断：
 
 1. **主损失**：每 100 步 `L_DD` + 窗口 100 的滑动平均；
-2. **辅助损失**：每 100 步 `L_freq`、当前 `lambda_freq`、`L_div`、`lambda_div`；
-3. **调制幅度**：每 200 步每层 `||phi_i^(l)||_2` 的类内均值/方差，
-   以及每维方差均值；
-4. **频率残差分解**：每 500 步每类抽 2 个实例，打印 top-k 中残差最大/最小
-   的 3 个频率维度（含 channel/u/v 坐标）；
-5. **分工诊断**：每 1000 步比较“无调制共享骨干”与“有调制”的
-   top-k 频率对齐损失，以及到对应真实初始化图像的像素 MSE；
-6. **梯度范数**：每 200 步分别记录 SIREN / V / 频率码的梯度范数；
-7. **预算统计**：训练前打印参数量分解与 DDiF 每实例 SIREN 的对比。
+2. **辅助损失**：每 100 步 `L_freq`、`lambda_freq`、`L_div`、`lambda_div`、
+   `L_anchor`、`lambda_anchor`；
+3. **调制幅度/空间变化**：每 200 步每层 `||phi_i^(l)||`、实例间方差、
+   **坐标维度标准差**、通道方差；
+4. **频率残差分解**：每 500 步每类抽 2 个实例，打印 signed DCT 残差
+   最大/最小的 3 个频率维度；
+5. **频率码漂移**：每 500 步打印 `||f_i - f_i_init||_2` 的类内均值和最大值；
+6. **分工诊断**：每 1000 步比较“无调制共享骨干”与“有调制”的
+   top-k 频率对齐损失、像素 MSE、图像 mean/std；
+7. **梯度范数**：每 200 步记录 SIREN / V+Phi / 频率码的梯度范数；
+8. **Stage 1 信息量诊断**：训练前打印类均值频率码的相对能量和类内平均
+   相关系数；
+9. **预算统计**：训练前打印 SIREN / V / Phi / 码的参数量分解。
 
 `metrics.jsonl` 的 `phase` 字段包括 `budget`、`evr`、`stage1`、
-`stage2`、`modulation`、`freq_residual`、`shared_vs_modulated`、`grad_norm`。
+`stage1_info`、`stage2`、`modulation`、`freq_residual`、`anchor_drift`、
+`shared_vs_modulated`、`grad_norm`。
 
 ---
 
 ## 8. 验证状态
 
-- `python -m unittest tests.test_fmnerd`: 8 个 CPU 单元测试通过
+- `python -m unittest tests.test_fmnerd`: 15 个 CPU 单元测试通过
   （DCT round-trip、EVR mask 计数与 per-channel 一致性、预算、
   V 初始近零、梯度、消融、保存/加载、多样性正则）。
 - `python -m unittest tests.test_integration`: TM / DM / DC 三个入口的

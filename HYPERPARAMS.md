@@ -3,7 +3,7 @@
 所有脚本都通过环境变量覆盖参数，不需要改脚本正文：
 
 ```bash
-METHOD=TM DATASET=CIFAR10 IPC=1 bash scripts/run_experiment.sh
+METHOD=TM DATASET=CIFAR10 IPC=10 bash scripts/run_experiment.sh
 ```
 
 `METHOD` 取 `TM` / `DM` / `DC`；`DATASET` 取 `CIFAR10` / `CIFAR100` / `ImageNet`；
@@ -11,24 +11,44 @@ ImageNet 用 `SUBSET=nette` 或 `SUBSET=woof`。
 
 ---
 
-## 1. IPC=1 推荐默认值（脚本已内置）
+## 1. 主实验默认值（IPC=10，脚本已内置）
 
-| 数据集 | 模型 | res | `msz_per_channel` | `k` | 解码张数/类 | Stage 1 | real/train batch | TM `batch_syn` | DM/DC `batch_syn` |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| CIFAR-10 | ConvNetD3 | 32 | 16 | 48 | 52 | 2000 | 256 | 256 | 0（全量） |
-| CIFAR-100 | ConvNetD3 | 32 | 16 | 48 | 45 | 2000 | 256 | 128 | 0（全量） |
-| ImageNet-Nette | ConvNetD5 | 128 | 64 | 192 | 227 | 3000 | 64 | 102 | 8 |
-| ImageNet-Woof | ConvNetD5 | 128 | 64 | 192 | 227 | 3000 | 64 | 102 | 8 |
+> IPC=1 只作为 sanity check；核心比较场景使用 IPC=10。
+
+| 数据集 | 模型 | res | msz | k | width (shared/cond) | Phi width | n/class | Stage 1 | real/train | TM batch_syn | DM/DC batch_syn |
+|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| CIFAR-10 | ConvNetD3 | 32 | 32 | 96 | 16 (1/3) | 8 | 274 | 2000 | 256 | 256 | 0（全量） |
+| CIFAR-100 | ConvNetD3 | 32 | 32 | 96 | 16 (1/3) | 8 | 274 | 2000 | 256 | 128 | 0（全量） |
+| ImageNet-Nette | ConvNetD5 | 128 | 256 | 768 | 16 (1/3) | 8 | 603 | 3000 | 64 | 102 | 8 |
+| ImageNet-Woof | ConvNetD5 | 128 | 256 | 768 | 16 (1/3) | 8 | 603 | 3000 | 64 | 102 | 8 |
+
+IPC=1 sanity check（不用于核心比较）：
+
+| 数据集 | msz | k | width (shared/cond) | n/class |
+|---|---:|---:|---|---:|
+| CIFAR-10 / CIFAR-100 | 16 | 48 | 6 (2/2) | 48 |
+| ImageNet-Nette / Woof | 64 | 192 | 20 (2/2) | 226 |
+
+IPC=50：
+
+| 数据集 | msz | k | width (shared/cond) | n/class |
+|---|---:|---:|---|---:|
+| CIFAR-10 / CIFAR-100 | 64 | 192 | 16 (1/3) | 759 |
+| ImageNet-Nette / Woof | 512 | 1536 | 16 (1/3) | 1564 |
 
 共同默认值：
 
 ```text
-num_shared_layers = 2      num_cond_layers = 2
+num_shared_layers = 1      num_cond_layers = 3  (IPC=1 sanity 用 2/2)
+layer_size          = 16   (IPC=1: CIFAR6 / ImageNet20)
+stage1_target     = spatial_avg (m=8) / representative
 stage1_lr         = 5e-4   stage1_steps    = 2000 / 3000 (ImageNet)
 lr_code           = 5e-4
 lr_siren          = 1e-4   (ImageNet 的 DM/DC 用 5e-5)
-lambda_freq       = 0.1    freq_warmup     = 1000
+lambda_freq       = 0.1    freq_warmup     = 1500
 lambda_div        = 1e-3   div_tau         = 1e-4
+lambda_anchor     = 1e-2 -> 1e-4 (3000 steps)
+use_spatial_basis = True   basis_width     = 8
 vc_init_std       = 1e-4   code_init_scale = 1.0
 modulation_code_scale = 1.0 (residual) / 0.1 (absolute)
 siren_init        = ddif   (不要用 sqrt6，除非专门做低频谱消融)
@@ -55,31 +75,31 @@ code_std_floor    = 1e-3
 
 | 数据集 | IPC=1 | IPC=2 | IPC=10 | IPC=50 |
 |---|---:|---:|---:|---:|
-| CIFAR-10 / CIFAR-100 | 16 | 32 | 64 | 64 |
+| CIFAR-10 / CIFAR-100 | 16 | 32 | 32 | 64 |
 | ImageNet-Subset | 64 | 64 | 256 | 512 |
 
-SIREN 宽度 `layer_size` 与 `w0` 仍由 DDiF `hyper_params.py` 按
-`dataset/res/ipc` 自动选择，例如：
+脚本的 SIREN 宽度/分割点默认值（`w0` 仍来自 DDiF `hyper_params.py`）：
 
-| 数据集 | IPC=1 | IPC=10 | IPC=50 |
-|---|---:|---:|---:|
-| CIFAR-10 | 6 | 6 | 20 |
-| CIFAR-100 | 10 | 15 | 30 |
-| ImageNet-128 | 20 | 20 | 40 |
+| 数据集 | IPC=1 | IPC=2 | IPC=10 | IPC=50 |
+|---|---|---|---|---|
+| CIFAR-10/100 | 6, 2/2 | 8, 1/3 | 16, 1/3 | 16, 1/3 |
+| ImageNet-128 | 20, 2/2 | 16, 1/3 | 16, 1/3 | 16, 1/3 |
 
 按这些配置得到的预算分布：
 
 | 数据集 | IPC | `k` | n/class | 使用率 |
 |---|---:|---:|---:|---:|
-| CIFAR-10 | 1 | 48 | 52 | 99.3% |
-| CIFAR-10 | 10 | 192 | 150 | 99.8% |
-| CIFAR-10 | 50 | 192 | 771 | 99.9% |
-| CIFAR-100 | 1 | 48 | 45 | 99.8% |
-| CIFAR-100 | 10 | 192 | 139 | 100.0% |
-| CIFAR-100 | 50 | 192 | 756 | 100.0% |
-| ImageNet-128 | 1 | 192 | 227 | 99.6% |
-| ImageNet-128 | 10 | 768 | 615 | 99.9% |
-| ImageNet-128 | 50 | 1536 | 1554 | 100.0% |
+| CIFAR-10 | 1 | 48 | 48 | 98.8% |
+| CIFAR-10 | 2 | 96 | 40 | 99.7% |
+| CIFAR-10 | 10 | 96 | 274 | 99.9% |
+| CIFAR-10 | 50 | 192 | 759 | 99.9% |
+| CIFAR-100 | 1 | 48 | 48 | 98.8% |
+| CIFAR-100 | 10 | 96 | 274 | 99.9% |
+| CIFAR-100 | 50 | 192 | 759 | 99.9% |
+| ImageNet-128 | 1 | 192 | 226 | 99.8% |
+| ImageNet-128 | 2 | 192 | 471 | 99.8% |
+| ImageNet-128 | 10 | 768 | 603 | 99.9% |
+| ImageNet-128 | 50 | 1536 | 1564 | 99.9% |
 
 > 想严格控制 `k` 时可直接覆盖：
 > `bash scripts/run_cifar10.sh TM --k 96`
@@ -109,22 +129,22 @@ SIREN 宽度 `layer_size` 与 `w0` 仍由 DDiF `hyper_params.py` 按
 `num_shared_layers + num_cond_layers` 是包含输出层的总层数。**增加一个
 受调制层会新增一个 `k × width` 的 V 矩阵**，代价远大于增加共享层：
 
-| 配置（shared/cond） | SIREN/类 | V/类 | n/class | 说明 |
-|---|---:|---:|---:|---|
-| 4（2/2） | 643 | 1,824 | 38 | 实例信息进入最后 2 层 |
-| 4（1/3） | 643 | 3,360 | 22 | 更早注入实例信息；实测 43.47% |
-| 5（1/4） | 915 | 4,896 | ≈3 | 受调制层太贵，不现实 |
-| 5（2/3） | 915 | 3,360 | 19 | 折中 |
-| 5（3/2） | 915 | 1,824 | 35 | 加共享层便宜，但不加实例条件 |
-| 6（2/4） | 1,187 | 4,896 | 0 | 超预算 |
+| 配置（shared/cond） | SIREN/类 | V/类 | Phi/类 | n/class |
+|---|---:|---:|---:|---:|
+| 4（2/2） | 643 | 1,824 | 267 | 35 |
+| 4（1/3） | 643 | 3,360 | 411 | 18 |
+| 5（1/4） | 915 | 4,896 | 411 | 不可行（超预算） |
+| 5（2/3） | 915 | 3,360 | 411 | 15 |
+| 5（3/2） | 915 | 1,824 | 267 | 32 |
+| 6（2/4） | 1,187 | 4,896 | 411 | ≈0 |
 
 宽度=8 时同样的深度便宜得多：
 
-| 配置 | SIREN/类 | V/类 | n/class |
-|---|---:|---:|---:|
-| 4（1/3） | 195 | 1,824 | ≈42 |
-| 5（1/4） | 267 | 2,592 | ≈34 |
-| 6（2/4） | 339 | 2,592 | ≈33 |
+| 配置 | SIREN/类 | V/类 | Phi/类 | n/class |
+|---|---:|---:|---:|---:|
+| 4（1/3） | 195 | 1,824 | 267 | ≈40 |
+| 5（1/4） | 267 | 2,592 | 339 | ≈30 |
+| 6（2/4） | 339 | 2,592 | 339 | ≈29 |
 
 结论：**想加深，优先降宽度到 8，而不是在 width=16 上继续加受调制层。**
 深度本身不是当前主要瓶颈；先做 `width=8, 1/3`，再考虑 `width=8, 1/4`。
@@ -217,10 +237,19 @@ EXTRA_ARGS="--vc_shared True --lambda_freq_target 0.05" \
 # 关闭频率对齐损失
 USE_FREQ_LOSS=0 bash scripts/run_cifar10.sh TM --FLAG nofreq
 
+# 关闭频率码锚定
+USE_ANCHOR_LOSS=0 bash scripts/run_cifar10.sh TM --FLAG noanchor
+
+# 关闭逐坐标调制，退回全局移位
+USE_SPATIAL_BASIS=0 bash scripts/run_cifar10.sh TM --FLAG globalshift
+
+# Stage 1 用类中心最近真实实例
+STAGE1_TARGET=representative bash scripts/run_cifar10.sh TM --FLAG repr
+
 # 关闭多样性正则
 USE_DIV_LOSS=0 bash scripts/run_cifar10.sh TM --FLAG nodiv
 
-# 只保留 Stage 1 类基（Stage 2 调制置零、f/V 冻结）
+# 只保留 Stage 1 类基（Stage 2 调制置零、f/V/Phi 冻结）
 STAGE1_ONLY=1 bash scripts/run_cifar10.sh TM --FLAG stage1only
 
 # 全局共享 V（验证每类 V_c 的必要性）

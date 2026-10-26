@@ -187,6 +187,63 @@ class TestSynSet(unittest.TestCase):
             aux, _ = synset.auxiliary_losses(out, ids, 0)
             self.assertTrue(torch.isfinite(aux))
 
+    def test_spatial_basis_and_global_modulation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            spatial = make_synset(tmp, stage1_steps=0, use_spatial_basis=True)
+            spatial.initialize_from_dataset(images, labels, indices)
+            global_mod = make_synset(
+                tmp, stage1_steps=0, use_spatial_basis=False,
+                stage1_ckpt=os.path.join(tmp, "s1_global.pt"),
+            )
+            global_mod.initialize_from_dataset(images, labels, indices)
+            ids = torch.arange(6)
+            a, _ = spatial.get(indices=ids)
+            b, _ = global_mod.get(indices=ids)
+            self.assertEqual(tuple(a.shape), tuple(b.shape))
+            stats = spatial.renderer.modulation_statistics(
+                spatial.modulation_codes(spatial.codes.detach()),
+                spatial.label_syn.to(spatial.device),
+                spatial.coords,
+            )
+            self.assertTrue(all("spatial_std" in item for item in stats))
+            self.assertGreater(spatial.p_basis_total, 0)
+            self.assertEqual(global_mod.p_basis_total, 0)
+
+    def test_stage1_target_representative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(
+                tmp, stage1_steps=0, stage1_target="representative"
+            )
+            synset.initialize_from_dataset(images, labels, indices)
+            self.assertEqual(tuple(synset.stage1_targets.shape),
+                             (3, 3, 16, 16))
+            for c in range(3):
+                dist = (
+                    images[torch.tensor(indices[c])]
+                    - synset.stage1_targets[c].cpu()
+                ).pow(2).flatten(1).sum(1)
+                self.assertTrue(bool((dist == dist.min()).any()))
+
+    def test_anchor_schedule_and_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(tmp, stage1_steps=0, use_anchor_loss=True)
+            synset.initialize_from_dataset(images, labels, indices)
+            self.assertTrue(
+                torch.allclose(synset.code_init, synset.codes.detach(), atol=1e-7)
+            )
+            self.assertAlmostEqual(synset.lambda_anchor(0), 1e-2, places=7)
+            self.assertAlmostEqual(
+                synset.lambda_anchor(synset.anchor_decay_steps), 1e-4, places=7
+            )
+            ids = torch.arange(4)
+            out, _ = synset.get(indices=ids)
+            aux, metrics = synset.auxiliary_losses(out, ids, 10)
+            self.assertIn("loss_anchor", metrics)
+            self.assertGreaterEqual(metrics["lambda_anchor"], 1e-4)
+
     def test_ablation_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             images, labels, indices = make_dataset()
@@ -217,10 +274,14 @@ class TestSynSet(unittest.TestCase):
             )
             shared.initialize_from_dataset(images, labels, indices)
             self.assertLess(shared.p_modulation_total, per_class.p_modulation_total)
-            self.assertEqual(
-                shared.p_modulation_total,
-                sum(p.numel() for p in shared.renderer.modulation.parameters()),
+            expected = sum(
+                p.numel() for p in shared.renderer.modulation.parameters()
             )
+            if shared.renderer.spatial_basis is not None:
+                expected += sum(
+                    p.numel() for p in shared.renderer.spatial_basis.parameters()
+                )
+            self.assertEqual(shared.p_modulation_total, expected)
 
     def test_stage1_checkpoint_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

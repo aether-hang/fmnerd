@@ -16,7 +16,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 METHOD="${METHOD:-TM}"
 DATASET="${DATASET:-CIFAR10}"
 SUBSET="${SUBSET:-nette}"
-IPC="${IPC:-1}"
+IPC="${IPC:-10}"
 SEED="${SEED:-0}"
 CUDA_ID="${CUDA_ID:-0}"
 PYTHON="${PYTHON:-python}"
@@ -45,8 +45,13 @@ case "$DATASET" in
     RES="${RES:-32}"
     MODEL="${MODEL:-ConvNetD3}"
     DEFAULT_DATA="$DATA_ROOT"
-    DEFAULT_MSZ=64
-    case "$IPC" in 1) DEFAULT_MSZ=16 ;; 2) DEFAULT_MSZ=32 ;; esac
+    DEFAULT_MSZ=32
+    DEFAULT_LAYER=16; DEFAULT_SHARED=1; DEFAULT_COND=3
+    case "$IPC" in
+      1) DEFAULT_MSZ=16; DEFAULT_LAYER=6; DEFAULT_SHARED=2; DEFAULT_COND=2 ;;
+      2) DEFAULT_MSZ=32; DEFAULT_LAYER=8 ;;
+      50) DEFAULT_MSZ=64 ;;
+    esac
     DEFAULT_BATCH_SYN=$([ "$METHOD" = "TM" ] && echo 256 || echo 0)
     DEFAULT_BATCH_REAL=256
     DEFAULT_BATCH_TRAIN=256
@@ -56,8 +61,13 @@ case "$DATASET" in
     RES="${RES:-32}"
     MODEL="${MODEL:-ConvNetD3}"
     DEFAULT_DATA="$DATA_ROOT"
-    DEFAULT_MSZ=64
-    case "$IPC" in 1) DEFAULT_MSZ=16 ;; 2) DEFAULT_MSZ=32 ;; esac
+    DEFAULT_MSZ=32
+    DEFAULT_LAYER=16; DEFAULT_SHARED=1; DEFAULT_COND=3
+    case "$IPC" in
+      1) DEFAULT_MSZ=16; DEFAULT_LAYER=6; DEFAULT_SHARED=2; DEFAULT_COND=2 ;;
+      2) DEFAULT_MSZ=32; DEFAULT_LAYER=8 ;;
+      50) DEFAULT_MSZ=64 ;;
+    esac
     # CIFAR-100 has 10x more classes than CIFAR-10; keep the MTT graph smaller.
     DEFAULT_BATCH_SYN=$([ "$METHOD" = "TM" ] && echo 128 || echo 0)
     DEFAULT_BATCH_REAL=256
@@ -69,7 +79,9 @@ case "$DATASET" in
     MODEL="${MODEL:-ConvNetD5}"
     DEFAULT_DATA="$DATA_ROOT/imagenet/$SUBSET_DIR"
     DEFAULT_MSZ=256
+    DEFAULT_LAYER=16; DEFAULT_SHARED=1; DEFAULT_COND=3
     if [ "$IPC" -le 2 ]; then DEFAULT_MSZ=64; fi
+    if [ "$IPC" -eq 1 ]; then DEFAULT_LAYER=20; DEFAULT_SHARED=2; DEFAULT_COND=2; fi
     if [ "$IPC" -ge 50 ]; then DEFAULT_MSZ=512; fi
     DEFAULT_BATCH_SYN=$([ "$METHOD" = "TM" ] && echo 102 || echo 8)
     DEFAULT_BATCH_REAL=64
@@ -84,6 +96,9 @@ esac
 
 DATA_PATH="${DATA_PATH:-$DEFAULT_DATA}"
 MSZ="${MSZ:-$DEFAULT_MSZ}"
+LAYER_SIZE="${LAYER_SIZE:-$DEFAULT_LAYER}"
+NUM_SHARED="${NUM_SHARED:-$DEFAULT_SHARED}"
+NUM_COND="${NUM_COND:-$DEFAULT_COND}"
 K="${K:-}"
 BATCH_SYN="${BATCH_SYN:-$DEFAULT_BATCH_SYN}"
 BATCH_REAL="${BATCH_REAL:-$DEFAULT_BATCH_REAL}"
@@ -98,8 +113,6 @@ DIPC="${DIPC:-0}"
 
 STAGE1_STEPS="${STAGE1_STEPS:-$DEFAULT_STAGE1}"
 STAGE1_LR="${STAGE1_LR:-5e-4}"
-NUM_SHARED="${NUM_SHARED:-2}"
-NUM_COND="${NUM_COND:-2}"
 LR_CODE="${LR_CODE:-5e-4}"
 if [ -n "${LR_SIREN:-}" ]; then
   :
@@ -113,7 +126,15 @@ fi
 LR_SIREN_LATE_SCALE="${LR_SIREN_LATE_SCALE:-0.1}"
 LAMBDA_FREQ="${LAMBDA_FREQ:-0.1}"
 LAMBDA_DIV="${LAMBDA_DIV:-1e-3}"
-FREQ_WARMUP="${FREQ_WARMUP:-1000}"
+FREQ_WARMUP="${FREQ_WARMUP:-1500}"
+USE_SPATIAL_BASIS="${USE_SPATIAL_BASIS:-1}"
+BASIS_WIDTH="${BASIS_WIDTH:-8}"
+STAGE1_TARGET="${STAGE1_TARGET:-spatial_avg}"
+STAGE1_SAMPLE_SIZE="${STAGE1_SAMPLE_SIZE:-8}"
+USE_ANCHOR_LOSS="${USE_ANCHOR_LOSS:-1}"
+LAMBDA_ANCHOR_START="${LAMBDA_ANCHOR_START:-1e-2}"
+LAMBDA_ANCHOR_TARGET="${LAMBDA_ANCHOR_TARGET:-1e-4}"
+ANCHOR_DECAY_STEPS="${ANCHOR_DECAY_STEPS:-3000}"
 CODE_INIT_SCALE="${CODE_INIT_SCALE:-1.0}"
 MODULATION_CODE_SCALE="${MODULATION_CODE_SCALE:-}"
 SIREN_INIT="${SIREN_INIT:-ddif}"
@@ -130,6 +151,8 @@ to_bool() {
 }
 USE_FREQ_LOSS="$(to_bool "${USE_FREQ_LOSS:-1}")"
 USE_DIV_LOSS="$(to_bool "${USE_DIV_LOSS:-1}")"
+USE_SPATIAL_BASIS="$(to_bool "$USE_SPATIAL_BASIS")"
+USE_ANCHOR_LOSS="$(to_bool "$USE_ANCHOR_LOSS")"
 STAGE1_ONLY="$(to_bool "${STAGE1_ONLY:-0}")"
 VC_SHARED="$(to_bool "${VC_SHARED:-0}")"
 
@@ -164,6 +187,12 @@ ARGS=(
   --lr_siren_late_scale "$LR_SIREN_LATE_SCALE"
   --lambda_freq_target "$LAMBDA_FREQ" --freq_warmup "$FREQ_WARMUP"
   --lambda_div "$LAMBDA_DIV"
+  --use_spatial_basis "$USE_SPATIAL_BASIS" --basis_width "$BASIS_WIDTH"
+  --stage1_target "$STAGE1_TARGET" --stage1_sample_size "$STAGE1_SAMPLE_SIZE"
+  --use_anchor_loss "$USE_ANCHOR_LOSS"
+  --lambda_anchor_start "$LAMBDA_ANCHOR_START"
+  --lambda_anchor_target "$LAMBDA_ANCHOR_TARGET"
+  --anchor_decay_steps "$ANCHOR_DECAY_STEPS"
   --code_init_scale "$CODE_INIT_SCALE"
   --siren_init "$SIREN_INIT"
   --code_mode "$CODE_MODE" --code_std_floor "$CODE_STD_FLOOR"

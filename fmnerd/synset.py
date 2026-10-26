@@ -25,6 +25,7 @@ import os
 from collections import deque
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -61,6 +62,10 @@ class FMNeRD(nn.Module):
         modulation_code_scale=None,
         code_mode="residual",
         code_std_floor=1e-3,
+        use_spatial_basis=True,
+        basis_width=8,
+        stage1_target="spatial_avg",
+        stage1_sample_size=8,
         stage1_steps=2000,
         stage1_lr=5e-4,
         stage1_ckpt=None,
@@ -69,12 +74,16 @@ class FMNeRD(nn.Module):
         stage1_eval_every=200,
         use_freq_loss=True,
         use_div_loss=True,
+        use_anchor_loss=True,
         stage1_only=False,
         lambda_freq_start=0.01,
         lambda_freq_target=0.1,
-        freq_warmup=1000,
+        freq_warmup=1500,
         lambda_div=1e-3,
         div_tau=1e-4,
+        lambda_anchor_start=1e-2,
+        lambda_anchor_target=1e-4,
+        anchor_decay_steps=3000,
         lr_code=5e-4,
         lr_siren=1e-4,
         lr_siren_late_scale=0.1,
@@ -106,6 +115,12 @@ class FMNeRD(nn.Module):
             modulation_code_scale = 1.0 if self.code_mode == "residual" else 0.1
         self.modulation_code_scale = float(modulation_code_scale)
         self.code_std_floor = float(code_std_floor)
+        self.use_spatial_basis = bool(use_spatial_basis)
+        self.basis_width = int(basis_width)
+        if stage1_target not in ("spatial_avg", "representative"):
+            raise ValueError("stage1_target must be spatial_avg or representative")
+        self.stage1_target = str(stage1_target)
+        self.stage1_sample_size = int(stage1_sample_size)
         self.stage1_steps = int(stage1_steps)
         self.stage1_lr = float(stage1_lr)
         self.stage1_ckpt = stage1_ckpt
@@ -114,12 +129,16 @@ class FMNeRD(nn.Module):
         self.stage1_eval_every = max(1, int(stage1_eval_every))
         self.use_freq_loss = bool(use_freq_loss)
         self.use_div_loss = bool(use_div_loss)
+        self.use_anchor_loss = bool(use_anchor_loss)
         self.stage1_only = bool(stage1_only)
         self.lambda_freq_start = float(lambda_freq_start)
         self.lambda_freq_target = float(lambda_freq_target)
         self.freq_warmup = max(1, int(freq_warmup))
         self.lambda_div = float(lambda_div)
         self.div_tau = float(div_tau)
+        self.lambda_anchor_start = float(lambda_anchor_start)
+        self.lambda_anchor_target = float(lambda_anchor_target)
+        self.anchor_decay_steps = max(1, int(anchor_decay_steps))
         self.lr_code = float(lr_code)
         self.lr_siren = float(lr_siren)
         self.lr_siren_late_scale = float(lr_siren_late_scale)
@@ -176,18 +195,22 @@ class FMNeRD(nn.Module):
             init_mode=self.siren_init,
             vc_init_std=self.vc_init_std,
             vc_shared=self.vc_shared,
+            use_spatial_basis=self.use_spatial_basis,
+            basis_width=self.basis_width,
         ).to(self.device)
 
         # ---- budget and number of decoded images per class
         self.budget = self.num_classes * self.ipc * self.channel * hw
         self.p_siren_per_class = self.renderer.siren.num_parameters() // self.num_classes
         self.p_siren_total = self.renderer.siren.num_parameters()
-        self.p_modulation_total = self.renderer.modulation.parameter_count()
-        self.p_modulation_per_class = (
-            self.p_modulation_total
-            if self.vc_shared
-            else self.p_modulation_total // self.num_classes
+        self.p_v_total = self.renderer.modulation.parameter_count()
+        self.p_basis_total = (
+            self.renderer.spatial_basis.parameter_count()
+            if self.renderer.spatial_basis is not None
+            else 0
         )
+        self.p_modulation_total = self.p_v_total + self.p_basis_total
+        self.p_modulation_per_class = self.p_modulation_total // self.num_classes if self.num_classes else 0
         auto_n = int(
             (self.budget - self.p_siren_total - self.p_modulation_total)
             // max(1, self.num_classes * self.k)
@@ -226,8 +249,10 @@ class FMNeRD(nn.Module):
         self.register_buffer("mask", torch.zeros(0))
         self.register_buffer("evr", torch.zeros(0))
         self.register_buffer("class_mean", torch.zeros(0))
+        self.register_buffer("stage1_targets", torch.zeros(0))
         self.register_buffer("code_mean", torch.zeros(0))
         self.register_buffer("code_std", torch.ones(0))
+        self.register_buffer("code_init", torch.zeros(0))
         self.register_buffer("diag_refs", torch.zeros(0))
         self.register_buffer("diag_ref_labels", torch.zeros(0, dtype=torch.long))
         self.register_buffer(
@@ -287,6 +312,8 @@ class FMNeRD(nn.Module):
             "budget": int(self.budget),
             "siren_total": int(self.p_siren_total),
             "siren_per_class": int(self.p_siren_per_class),
+            "v_total": int(self.p_v_total),
+            "basis_total": int(self.p_basis_total),
             "modulation_total": int(self.p_modulation_total),
             "modulation_per_class": int(self.p_modulation_per_class),
             "codes_total": int(self.p_codes_total),
@@ -311,12 +338,17 @@ class FMNeRD(nn.Module):
             )
         )
         self._log(
-            "  modulation V_c per class    : {:,}  x {} = {:,}  (vc_shared={})".format(
-                p["modulation_per_class"],
-                self.num_classes if not self.vc_shared else 1,
-                p["modulation_total"],
-                self.vc_shared,
+            "  linear V_c total            : {:,}  (vc_shared={})".format(
+                p["v_total"], self.vc_shared
             )
+        )
+        self._log(
+            "  spatial basis Phi total     : {:,}  (use_spatial_basis={}, width={})".format(
+                p["basis_total"], self.use_spatial_basis, self.basis_width
+            )
+        )
+        self._log(
+            "  modulation total / class    : {:,}".format(p["modulation_per_class"])
         )
         self._log(
             "  frequency codes per instance: {:,}  x {:,} = {:,}".format(
@@ -342,7 +374,7 @@ class FMNeRD(nn.Module):
         self._log(
             "  comparison: one DDiF SIREN/instance = {:,} params -> at most {:,} "
             "instances under the same budget; this method stores {:,} codes "
-            "({} floats/instance) plus class-level V.".format(
+            "({} floats/instance) plus class-level V/Phi.".format(
                 p["siren_per_class"], ddif_instances, self.num_total, self.k
             )
         )
@@ -418,6 +450,9 @@ class FMNeRD(nn.Module):
         for c in range(self.num_classes):
             mean[c] = images[indices_class[c]].mean(dim=0)
         self.class_mean = mean.to(self.device)
+        self.stage1_targets = self._build_stage1_targets(
+            images, indices_class, mean
+        )
 
         # Real-image initialisation, as in FreD.
         init_indices = choose_real_init_indices(
@@ -434,15 +469,26 @@ class FMNeRD(nn.Module):
             ).detach().cpu()
         del init_images, freq
 
+        with torch.no_grad():
+            mean_freq = dct_2d(self.class_mean, self.mat_h, self.mat_w)
+            mean_code = extract_selected(
+                mean_freq,
+                self.freq_indices,
+                torch.arange(self.num_classes, device=self.device),
+            ).detach().cpu()
+        self._log_stage1_information(raw_codes, mean_code)
+
         if self.code_mode == "residual":
-            # The shared backbone already owns the class mean.  Codes encode
-            # only the instance residual around that mean, standardized per
-            # frequency dimension so that DC/low-frequency coefficients do
-            # not dominate the MSE.
+            # The shared backbone already owns the Stage-1 class target.
+            # Codes encode only the instance residual around that target,
+            # standardized per frequency dimension so that DC/low-frequency
+            # coefficients do not dominate the MSE.
             with torch.no_grad():
-                mean_freq = dct_2d(self.class_mean, self.mat_h, self.mat_w)
+                target_freq = dct_2d(
+                    self.stage1_targets, self.mat_h, self.mat_w
+                )
                 code_mean = extract_selected(
-                    mean_freq,
+                    target_freq,
                     self.freq_indices,
                     torch.arange(self.num_classes, device=self.device),
                 ).detach().cpu()
@@ -474,6 +520,7 @@ class FMNeRD(nn.Module):
 
         self.code_mean = code_mean.to(self.device)
         self.code_std = code_std.to(self.device)
+        self.code_init = codes.detach().clone().to(self.device)
         self.codes = nn.Parameter(
             codes.to(self.device),
             requires_grad=not self.stage1_only,
@@ -481,6 +528,9 @@ class FMNeRD(nn.Module):
         if self.stage1_only:
             for param in self.renderer.modulation.parameters():
                 param.requires_grad_(False)
+            if self.renderer.spatial_basis is not None:
+                for param in self.renderer.spatial_basis.parameters():
+                    param.requires_grad_(False)
 
         # Four real references per class for the shared-vs-modulated
         # diagnostic.  They are the images that initialised the first four
@@ -526,8 +576,65 @@ class FMNeRD(nn.Module):
     # ------------------------------------------------------------------
     # Stage 1
     # ------------------------------------------------------------------
+    def _build_stage1_targets(self, images, indices_class, class_mean):
+        targets = torch.zeros(
+            self.num_classes,
+            self.channel,
+            self.im_size[0],
+            self.im_size[1],
+            dtype=torch.float32,
+        )
+        for c in range(self.num_classes):
+            pool = np.asarray(indices_class[c])
+            if self.stage1_target == "representative":
+                class_images = images[pool]
+                dist = (class_images - class_mean[c]).pow(2).flatten(1).sum(dim=1)
+                targets[c] = class_images[int(dist.argmin())]
+            else:
+                m = min(self.stage1_sample_size, pool.size)
+                rng = np.random.RandomState(self.seed + 7919 * c)
+                chosen = rng.choice(pool, size=m, replace=False)
+                targets[c] = images[chosen].mean(dim=0)
+        self._log(
+            "[Stage 1] target={} (spatial_avg m={} / representative)"
+            .format(self.stage1_target, self.stage1_sample_size)
+        )
+        return targets.to(self.device)
+
+    def _log_stage1_information(self, raw_codes, mean_code):
+        """Diagnose how much of the class frequency content survives averaging."""
+        n = self.num_per_class
+        self._log("[Stage 1 diag] class-mean frequency-code information")
+        for c in range(self.num_classes):
+            inst = raw_codes[c * n : (c + 1) * n]
+            mean_norm = float(mean_code[c].norm().item())
+            inst_norm = float(inst.norm(dim=1).mean().item()) if n else 0.0
+            relative = mean_norm / max(inst_norm, 1e-12)
+            if n > 1:
+                centered = inst - inst.mean(dim=0, keepdim=True)
+                norms = centered.norm(dim=1)
+                denom = norms.unsqueeze(1) * norms.unsqueeze(0)
+                corr = (centered @ centered.t()) / denom.clamp_min(1e-12)
+                mask = ~torch.eye(n, dtype=torch.bool)
+                mean_corr = float(corr[mask].mean().item())
+            else:
+                mean_corr = 0.0
+            self._log(
+                "  class {:3d} | ||mean_f||/mean_i||f_i|| = {:.3f} | "
+                "mean off-diagonal corr = {:.3f}".format(c, relative, mean_corr)
+            )
+            self._metric(
+                "stage1_info",
+                0,
+                {
+                    "class": c,
+                    "relative_energy": relative,
+                    "mean_correlation": mean_corr,
+                },
+            )
+
     def _stage1_forward_all(self):
-        targets = self.class_mean.to(self.device).permute(0, 2, 3, 1).reshape(
+        targets = self.stage1_targets.to(self.device).permute(0, 2, 3, 1).reshape(
             self.num_classes, -1, self.channel
         )
         coords = self.coords.to(self.device)
@@ -551,6 +658,8 @@ class FMNeRD(nn.Module):
             "w0_initial": self.w0_initial,
             "w0": self.w0,
             "siren_init": self.siren_init,
+            "stage1_target": self.stage1_target,
+            "stage1_sample_size": self.stage1_sample_size,
         }
         for key, value in expected.items():
             if data.get(key) != value:
@@ -664,6 +773,8 @@ class FMNeRD(nn.Module):
                     "im_size": list(self.im_size),
                     "num_classes": self.num_classes,
                     "siren_init": self.siren_init,
+                    "stage1_target": self.stage1_target,
+                    "stage1_sample_size": self.stage1_sample_size,
                     "siren": {k: v.detach().cpu() for k, v in self.renderer.siren.state_dict().items()},
                     "stage1_steps": self.stage1_steps,
                     "stage1_lr": self.stage1_lr,
@@ -680,6 +791,8 @@ class FMNeRD(nn.Module):
         if self.codes is None:
             raise RuntimeError("initialize_from_dataset() must run before Stage 2")
         instance_params = [self.codes] + list(self.renderer.modulation.parameters())
+        if self.renderer.spatial_basis is not None:
+            instance_params += list(self.renderer.spatial_basis.parameters())
         trainable = [p for p in instance_params if p.requires_grad]
         self.optimizer_instance = (
             torch.optim.Adam(trainable, lr=self.lr_code) if trainable else None
@@ -752,11 +865,9 @@ class FMNeRD(nn.Module):
         labels = self.label_syn[indices]
         pred = self.predicted_frequency_codes(images, labels)
         target = self.codes[indices].detach()
-        if self.code_mode == "absolute":
-            residual = (pred.abs() - target.abs()).pow(2)
-        else:
-            residual = (pred - target).pow(2)
-        return residual
+        # Full signed DCT coefficients, exactly as requested.  For residual
+        # mode pred and target are already standardized class residuals.
+        return (pred - target).pow(2)
 
     def decode(self, indices, use_modulation=True):
         indices = self._normalise_indices(indices)
@@ -813,19 +924,23 @@ class FMNeRD(nn.Module):
     # Stage-2 auxiliary losses
     # ------------------------------------------------------------------
     def diversity_loss(self):
-        if self.stage1_only or not self.use_div_loss or self.num_per_class < 2:
+        if self.stage1_only or not self.use_div_loss:
             return self.codes.new_zeros(())
-        shifts = self.renderer.modulation(
-            self.modulation_codes(), self.label_syn.to(self.device)
+        terms = self.renderer.modulation_variance_terms(
+            self.modulation_codes(), self.label_syn.to(self.device), self.coords
         )
         total = self.codes.new_zeros(())
-        count = 0
-        for phi in shifts:
-            grouped = phi.view(self.num_classes, self.num_per_class, -1)
-            var = grouped.var(dim=1, unbiased=False)             # [Cnum, d]
+        for var in terms:
             total = total + torch.relu(self.div_tau - var).mean()
-            count += 1
-        return total / max(1, count)
+        return total / max(1, len(terms))
+
+    def lambda_anchor(self, step):
+        if not self.use_anchor_loss or self.stage1_only:
+            return 0.0
+        frac = min(1.0, float(step) / float(self.anchor_decay_steps))
+        return self.lambda_anchor_start + frac * (
+            self.lambda_anchor_target - self.lambda_anchor_start
+        )
 
     def frequency_loss(self, images, indices):
         return self.frequency_alignment(images, indices).mean()
@@ -838,6 +953,8 @@ class FMNeRD(nn.Module):
             "loss_div": 0.0,
             "lambda_freq": 0.0,
             "lambda_div": 0.0,
+            "loss_anchor": 0.0,
+            "lambda_anchor": 0.0,
         }
         total = zero
         if self.stage1_only:
@@ -855,6 +972,12 @@ class FMNeRD(nn.Module):
             total = total + self.lambda_div * div_loss
             metrics["loss_div"] = float(div_loss.detach().item())
             metrics["lambda_div"] = float(self.lambda_div)
+        if self.use_anchor_loss and self.code_init.numel() == self.codes.numel():
+            anchor = (self.codes - self.code_init).pow(2).mean()
+            lam_anchor = self.lambda_anchor(step)
+            total = total + lam_anchor * anchor
+            metrics["loss_anchor"] = float(anchor.detach().item())
+            metrics["lambda_anchor"] = float(lam_anchor)
         return total, metrics
 
     # ------------------------------------------------------------------
@@ -868,7 +991,8 @@ class FMNeRD(nn.Module):
         avg = sum(self.dd_window) / len(self.dd_window)
         self._log(
             "[Stage 2] iter {:5d} | L_DD {:.4f} | L_DD_avg{} {:.4f} | "
-            "L_freq {:.6f} (lambda {:.4f}) | L_div {:.6f} (lambda {:.1e})".format(
+            "L_freq {:.6f} (lambda {:.4f}) | L_div {:.6f} (lambda {:.1e}) | "
+            "L_anchor {:.6e} (lambda {:.1e})".format(
                 step,
                 value,
                 len(self.dd_window),
@@ -877,6 +1001,8 @@ class FMNeRD(nn.Module):
                 aux.get("lambda_freq", 0.0),
                 aux.get("loss_div", 0.0),
                 aux.get("lambda_div", 0.0),
+                aux.get("loss_anchor", 0.0),
+                aux.get("lambda_anchor", 0.0),
             )
         )
         self._metric(
@@ -889,6 +1015,8 @@ class FMNeRD(nn.Module):
                 "loss_div": aux.get("loss_div", 0.0),
                 "lambda_freq": aux.get("lambda_freq", 0.0),
                 "lambda_div": aux.get("lambda_div", 0.0),
+                "loss_anchor": aux.get("loss_anchor", 0.0),
+                "lambda_anchor": aux.get("lambda_anchor", 0.0),
                 "lr_siren": float(self.optimizer_siren.param_groups[0]["lr"]),
                 "lr_instance": float(self.optimizer_instance.param_groups[0]["lr"])
                 if self.optimizer_instance is not None
@@ -898,12 +1026,8 @@ class FMNeRD(nn.Module):
 
     @torch.no_grad()
     def log_modulation(self, step):
-        shifts = self.renderer.modulation.all_shifts(
-            self.modulation_codes(self.codes.detach()),
-            self.label_syn.to(self.device),
-        )
-        self._log("[diag {}] frequency code statistics".format(step))
         codes = self.codes.detach()
+        self._log("[diag {}] frequency code statistics".format(step))
         self._log(
             "  codes: mean={:.4e} std={:.4e} absmax={:.4e} | "
             "modulation_code_scale={:.3f} (phi sees mean={:.4e} std={:.4e})".format(
@@ -915,21 +1039,22 @@ class FMNeRD(nn.Module):
                 float((codes * self.modulation_code_scale).std(unbiased=False)),
             )
         )
-        self._log("[diag {}] modulation magnitude per layer".format(step))
-        for layer_idx, phi in enumerate(shifts):
-            grouped = phi.view(self.num_classes, self.num_per_class, -1)
-            norms = grouped.norm(dim=-1)                    # [Cnum, n]
-            per_dim_var = grouped.var(dim=1, unbiased=False)  # [Cnum, d]
+        stats = self.renderer.modulation_statistics(
+            self.modulation_codes(codes), self.label_syn.to(self.device), self.coords
+        )
+        self._log(
+            "[diag {}] modulation magnitude / spatial variation per layer".format(step)
+        )
+        for layer_idx, values in enumerate(stats):
             self._log(
-                "  layer {} (d={}): ||phi|| mean={:.4e} var={:.4e} "
-                "(class mean range {:.3e}..{:.3e}) | mean per-dim var={:.3e}".format(
+                "  layer {} (d={}): ||phi|| mean={:.4e} var={:.4e} | "
+                "mean coord-std={:.4e} | channel var={:.4e}".format(
                     self.renderer.siren.conditioned_indices[layer_idx],
-                    phi.shape[1],
-                    float(norms.mean()),
-                    float(norms.var(unbiased=False)),
-                    float(norms.mean(dim=1).min()),
-                    float(norms.mean(dim=1).max()),
-                    float(per_dim_var.mean()),
+                    values["dim"],
+                    values["phi_norm_mean"],
+                    values["phi_norm_var"],
+                    values["spatial_std"],
+                    values["channel_var"],
                 )
             )
             self._metric(
@@ -937,11 +1062,39 @@ class FMNeRD(nn.Module):
                 step,
                 {
                     "layer": int(self.renderer.siren.conditioned_indices[layer_idx]),
-                    "phi_norm_mean": float(norms.mean()),
-                    "phi_norm_var": float(norms.var(unbiased=False)),
-                    "phi_per_dim_var": float(per_dim_var.mean()),
+                    "phi_norm_mean": values["phi_norm_mean"],
+                    "phi_norm_var": values["phi_norm_var"],
+                    "phi_spatial_std": values["spatial_std"],
+                    "phi_channel_var": values["channel_var"],
                 },
             )
+
+    @torch.no_grad()
+    def log_anchor_drift(self, step):
+        if not self.use_anchor_loss or self.code_init.numel() != self.codes.numel():
+            return
+        diff = (self.codes.detach() - self.code_init).norm(dim=1)
+        grouped = diff.view(self.num_classes, self.num_per_class)
+        self._log(
+            "[diag {}] frequency-code drift ||f_i-f_i_init||_2 "
+            "(class mean / class max)".format(step)
+        )
+        for c in range(self.num_classes):
+            self._log(
+                "  class {:3d} | mean={:.4e} | max={:.4e}".format(
+                    c,
+                    float(grouped[c].mean()),
+                    float(grouped[c].max()),
+                )
+            )
+        self._metric(
+            "anchor_drift",
+            step,
+            {
+                "class{}_mean".format(c): float(grouped[c].mean())
+                for c in range(self.num_classes)
+            },
+        )
 
     @torch.no_grad()
     def log_frequency_residual(self, step, samples_per_class=2):
@@ -1095,6 +1248,7 @@ class FMNeRD(nn.Module):
             self.log_modulation(step)
         if freq_every > 0 and step % freq_every == 0:
             self.log_frequency_residual(step)
+            self.log_anchor_drift(step)
         if share_every > 0 and step % share_every == 0:
             self.log_shared_vs_modulated(step)
 
@@ -1123,12 +1277,22 @@ class FMNeRD(nn.Module):
                 k: v.detach().cpu()
                 for k, v in self.renderer.modulation.state_dict().items()
             },
+            "spatial_basis": (
+                {
+                    k: v.detach().cpu()
+                    for k, v in self.renderer.spatial_basis.state_dict().items()
+                }
+                if self.renderer.spatial_basis is not None
+                else None
+            ),
             "freq_indices": self.freq_indices.detach().cpu(),
             "mask": self.mask.detach().cpu(),
             "label_syn": self.label_syn.detach().cpu(),
             "class_mean": self.class_mean.detach().cpu(),
+            "stage1_targets": self.stage1_targets.detach().cpu(),
             "code_mean": self.code_mean.detach().cpu(),
             "code_std": self.code_std.detach().cpu(),
+            "code_init": self.code_init.detach().cpu(),
             "diag_refs": self.diag_refs.detach().cpu(),
             "diag_ref_labels": self.diag_ref_labels.detach().cpu(),
             "refs_per_class": int(self.refs_per_class),
@@ -1151,6 +1315,14 @@ class FMNeRD(nn.Module):
                 "modulation_code_scale": self.modulation_code_scale,
                 "code_mode": self.code_mode,
                 "code_std_floor": self.code_std_floor,
+                "use_spatial_basis": self.use_spatial_basis,
+                "basis_width": self.basis_width,
+                "stage1_target": self.stage1_target,
+                "stage1_sample_size": self.stage1_sample_size,
+                "use_anchor_loss": self.use_anchor_loss,
+                "lambda_anchor_start": self.lambda_anchor_start,
+                "lambda_anchor_target": self.lambda_anchor_target,
+                "anchor_decay_steps": self.anchor_decay_steps,
                 "renderer": self.renderer.config(),
             },
         }
@@ -1165,10 +1337,16 @@ class FMNeRD(nn.Module):
         self.codes = nn.Parameter(data["codes"].to(self.device), requires_grad=True)
         self.renderer.siren.load_state_dict(data["siren"])
         self.renderer.modulation.load_state_dict(data["modulation"])
+        if self.renderer.spatial_basis is not None and data.get("spatial_basis") is not None:
+            self.renderer.spatial_basis.load_state_dict(data["spatial_basis"])
         self.freq_indices = data["freq_indices"].to(self.device)
         self.mask = data["mask"].to(self.device)
         self.label_syn = data["label_syn"].to(self.device)
         self.class_mean = data["class_mean"].to(self.device)
+        if "stage1_targets" in data:
+            self.stage1_targets = data["stage1_targets"].to(self.device)
+        if "code_init" in data:
+            self.code_init = data["code_init"].to(self.device)
         if "code_mean" in data:
             self.code_mean = data["code_mean"].to(self.device)
         if "code_std" in data:
@@ -1191,6 +1369,22 @@ class FMNeRD(nn.Module):
             self.code_mode = str(cfg["code_mode"])
         if "code_std_floor" in cfg:
             self.code_std_floor = float(cfg["code_std_floor"])
+        if "use_spatial_basis" in cfg:
+            self.use_spatial_basis = bool(cfg["use_spatial_basis"])
+        if "basis_width" in cfg:
+            self.basis_width = int(cfg["basis_width"])
+        if "stage1_target" in cfg:
+            self.stage1_target = str(cfg["stage1_target"])
+        if "stage1_sample_size" in cfg:
+            self.stage1_sample_size = int(cfg["stage1_sample_size"])
+        if "use_anchor_loss" in cfg:
+            self.use_anchor_loss = bool(cfg["use_anchor_loss"])
+        if "lambda_anchor_start" in cfg:
+            self.lambda_anchor_start = float(cfg["lambda_anchor_start"])
+        if "lambda_anchor_target" in cfg:
+            self.lambda_anchor_target = float(cfg["lambda_anchor_target"])
+        if "anchor_decay_steps" in cfg:
+            self.anchor_decay_steps = int(cfg["anchor_decay_steps"])
         self._setup_stage2()
         self.initialized = True
         return data

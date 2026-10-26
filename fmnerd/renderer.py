@@ -392,9 +392,11 @@ class FMNeRDRenderer(nn.Module):
         num_cond_layers=2,
         w0_initial=30.0,
         w0=30.0,
-        init_mode="sqrt6",
+        init_mode="ddif",
         vc_init_std=1e-4,
         vc_shared=False,
+        use_spatial_basis=True,
+        basis_width=8,
     ):
         super().__init__()
         self.siren = ClassSharedSiren(
@@ -416,21 +418,152 @@ class FMNeRDRenderer(nn.Module):
             init_std=vc_init_std,
             vc_shared=vc_shared,
         )
+        self.use_spatial_basis = bool(use_spatial_basis)
+        self.spatial_basis = (
+            SpatialBasisBank(
+                num_classes=num_classes,
+                coords_dim=dim_in,
+                conditioned_indices=self.siren.conditioned_indices,
+                layer_dims=self.siren.layer_dims,
+                basis_width=basis_width,
+                w0_initial=w0_initial,
+                w0=w0,
+                init_mode=init_mode,
+            )
+            if self.use_spatial_basis
+            else None
+        )
         self.code_dim = int(code_dim)
         self.vc_shared = bool(vc_shared)
+        self.basis_width = int(basis_width)
+
+    def _shifts_for_class(self, class_id, codes_subset, coords):
+        vectors = self.modulation.vectors_for_class(class_id, codes_subset)
+        if not self.use_spatial_basis:
+            return vectors, False
+        bases = self.spatial_basis.forward_class(class_id, coords)
+        spatial_shifts = [
+            v.unsqueeze(1) * basis.unsqueeze(0)
+            for v, basis in zip(vectors, bases)
+        ]
+        return spatial_shifts, True
 
     def forward(self, coords, labels, codes=None, use_modulation=True):
-        shifts = None
-        if use_modulation and codes is not None:
-            shifts = self.modulation(codes, labels)
-        return self.siren(coords, labels, shifts)
+        labels = labels.to(device=coords.device, dtype=torch.long)
+        batch = int(labels.numel())
+        out = coords.new_zeros(batch, coords.shape[0], self.siren.dim_out)
+        for c in torch.unique(labels, sorted=True).tolist():
+            mask = labels == int(c)
+            shifts = None
+            spatial = False
+            if use_modulation and codes is not None:
+                shifts, spatial = self._shifts_for_class(
+                    int(c), codes[mask], coords
+                )
+            out[mask] = self.siren.forward_class(
+                int(c), coords, shifts, spatial=spatial
+            )
+        return out
 
     def parameter_counts(self):
         return {
             "siren_per_class": self.siren.num_parameters() // self.siren.num_classes,
             "siren_total": self.siren.num_parameters(),
-            "modulation_total": self.modulation.parameter_count(),
+            "v_total": self.modulation.parameter_count(),
+            "basis_total": (
+                self.spatial_basis.parameter_count()
+                if self.spatial_basis is not None
+                else 0
+            ),
         }
+
+    def modulation_variance_terms(self, codes, labels, coords):
+        """Per-layer ``[Cnum, d_l]`` modulation variance over instances.
+
+        For a coordinate-varying modulation ``phi_i(c,d) = Phi(c,d) v_i(d)``,
+        the instance variance at coordinate ``c`` is
+        ``Var_i(v_i(d)) * Phi(c,d)^2``.  We average over coordinates.
+        """
+        labels = labels.to(device=codes.device, dtype=torch.long)
+        terms = [
+            codes.new_zeros(self.siren.num_classes, d)
+            for d in self.modulation.layer_dims
+        ]
+        for c in range(self.siren.num_classes):
+            mask = labels == c
+            if not bool(mask.any()):
+                continue
+            vectors = self.modulation.vectors_for_class(c, codes[mask])
+            if self.use_spatial_basis:
+                bases = self.spatial_basis.forward_class(c, coords)
+                weights = [basis.pow(2).mean(dim=0) for basis in bases]
+            else:
+                weights = [
+                    torch.ones(v.shape[1], device=v.device, dtype=v.dtype)
+                    for v in vectors
+                ]
+            for j, (v, w) in enumerate(zip(vectors, weights)):
+                if v.shape[0] > 1:
+                    terms[j][c] = v.var(dim=0, unbiased=False) * w
+        return terms
+
+    def modulation_statistics(self, codes, labels, coords):
+        """Compact per-layer modulation statistics without [N, P, d] storage."""
+        labels = labels.to(device=codes.device, dtype=torch.long)
+        layer_count = len(self.modulation.layer_dims)
+        norms = [[] for _ in range(layer_count)]
+        spatial_stds = [[] for _ in range(layer_count)]
+        channel_vars = [[] for _ in range(layer_count)]
+        for c in range(self.siren.num_classes):
+            mask = labels == c
+            if not bool(mask.any()):
+                continue
+            vectors = self.modulation.vectors_for_class(c, codes[mask])
+            if self.use_spatial_basis:
+                bases = self.spatial_basis.forward_class(c, coords)
+            else:
+                bases = None
+            for j, v in enumerate(vectors):
+                if bases is not None:
+                    basis = bases[j]
+                    energy = basis.pow(2).sum(dim=0)              # [d]
+                    phi_norm = (v.pow(2) * energy.unsqueeze(0)).sum(dim=1).sqrt()
+                    spatial_std = (
+                        v.abs() * basis.std(dim=0, unbiased=False).unsqueeze(0)
+                    )
+                    channel_var = (
+                        v.var(dim=0, unbiased=False) * basis.pow(2).mean(dim=0)
+                        if v.shape[0] > 1
+                        else torch.zeros_like(v[0])
+                    )
+                    spatial_stds[j].append(spatial_std.mean().item())
+                else:
+                    phi_norm = v.norm(dim=1)
+                    spatial_stds[j].append(0.0)
+                    channel_var = (
+                        v.var(dim=0, unbiased=False)
+                        if v.shape[0] > 1
+                        else torch.zeros_like(v[0])
+                    )
+                norms[j].append(phi_norm.mean().item())
+                channel_vars[j].append(channel_var.mean().item())
+        stats = []
+        for j in range(layer_count):
+            norms_j = torch.tensor(norms[j])
+            stats.append(
+                {
+                    "dim": self.modulation.layer_dims[j],
+                    "phi_norm_mean": float(norms_j.mean()) if norms_j.numel() else 0.0,
+                    "phi_norm_var": float(norms_j.var(unbiased=False)) if norms_j.numel() else 0.0,
+                    "spatial_std": float(torch.tensor(spatial_stds[j]).mean())
+                    if spatial_stds[j]
+                    else 0.0,
+                    "channel_var": float(torch.tensor(channel_vars[j]).mean())
+                    if channel_vars[j]
+                    else 0.0,
+                }
+            )
+        return stats
 
     def config(self):
         cfg = self.siren.config()
@@ -438,7 +571,11 @@ class FMNeRDRenderer(nn.Module):
             {
                 "code_dim": self.code_dim,
                 "vc_shared": self.vc_shared,
-                "modulation_dims": list(self.siren.layer_dims[i] for i in self.siren.conditioned_indices),
+                "use_spatial_basis": self.use_spatial_basis,
+                "basis_width": self.basis_width,
+                "modulation_dims": list(
+                    self.siren.layer_dims[i] for i in self.siren.conditioned_indices
+                ),
             }
         )
         return cfg
