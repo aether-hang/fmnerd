@@ -213,7 +213,7 @@ def main(args):
                         for c in range(num_classes)
                     ],
                     dim=0,
-                )
+                ).to(args.device)
                 net.train()
                 net(img_real)
                 for module in net.modules():
@@ -222,7 +222,9 @@ def main(args):
 
             total_loss = torch.tensor(0.0, device=args.device)
             for c in range(num_classes):
-                img_real = get_images(images_all, indices_class, c, args.batch_real)
+                img_real = get_images(
+                    images_all, indices_class, c, args.batch_real
+                ).to(args.device)
                 lab_real = torch.ones(
                     (img_real.shape[0],), device=args.device, dtype=torch.long
                 ) * c

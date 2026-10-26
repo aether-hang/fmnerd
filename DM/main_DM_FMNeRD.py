@@ -199,7 +199,9 @@ def main(args):
         aux_accum = {}
         synset.on_train_step(it, args.Iteration)
         for c in range(num_classes):
-            img_real = get_images(images_all, indices_class, c, args.batch_real)
+            img_real = get_images(
+                images_all, indices_class, c, args.batch_real
+            ).to(args.device)
             if args.batch_syn > 0:
                 indices = np.random.permutation(
                     range(c * synset.num_per_class, (c + 1) * synset.num_per_class)

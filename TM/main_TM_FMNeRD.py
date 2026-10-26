@@ -290,7 +290,9 @@ def main(args):
 
         for step in range(args.syn_steps):
             if not indices_chunks:
-                indices = torch.randperm(len(syn_images))
+                indices = torch.randperm(
+                    len(syn_images), device=syn_images.device
+                )
                 indices_chunks = list(torch.split(indices, args.batch_syn))
             these_indices = indices_chunks.pop()
 
