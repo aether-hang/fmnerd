@@ -236,6 +236,12 @@ class FMNeRD(nn.Module):
         self.metrics_path = None
         self.stage1_history = []
 
+        # ``renderer.to(device)`` only moves the renderer.  The coordinate
+        # grid and the registered buffers (label_syn, empty mask/index
+        # placeholders, ...) must live on the same device as the SIREN,
+        # otherwise Stage 1 fails with "found at least two devices".
+        self.to(self.device)
+
     # ------------------------------------------------------------------
     # Coordinates / logging
     # ------------------------------------------------------------------
@@ -406,7 +412,7 @@ class FMNeRD(nn.Module):
         )
         for c in range(self.num_classes):
             mean[c] = images[indices_class[c]].mean(dim=0)
-        self.class_mean = mean
+        self.class_mean = mean.to(self.device)
 
         # Four real references per class for the shared-vs-modulated
         # diagnostic.  They are the images that initialised the first four
@@ -419,10 +425,10 @@ class FMNeRD(nn.Module):
             ref_idx.extend(
                 init_indices[start : start + self.refs_per_class].tolist()
             )
-        self.diag_refs = images[ref_idx].clone()
-        self.diag_ref_labels = torch.arange(self.num_classes).repeat_interleave(
-            self.refs_per_class
-        )
+        self.diag_refs = images[ref_idx].clone().to(self.device)
+        self.diag_ref_labels = torch.arange(
+            self.num_classes, device=self.device
+        ).repeat_interleave(self.refs_per_class)
 
         self.initialized = True
         self.log_budget()
@@ -456,9 +462,10 @@ class FMNeRD(nn.Module):
         targets = self.class_mean.to(self.device).permute(0, 2, 3, 1).reshape(
             self.num_classes, -1, self.channel
         )
+        coords = self.coords.to(self.device)
         losses = []
         for c in range(self.num_classes):
-            pred = self.renderer.siren.forward_class(c, self.coords)
+            pred = self.renderer.siren.forward_class(c, coords)
             losses.append((pred - targets[c]).pow(2).mean())
         return torch.stack(losses)
 
@@ -652,7 +659,7 @@ class FMNeRD(nn.Module):
         labels = self.label_syn[indices]
         codes = self.codes[indices] if (use_modulation and not self.stage1_only) else None
         out = self.renderer(
-            self.coords,
+            self.coords.to(self.device),
             labels,
             codes=codes,
             use_modulation=use_modulation and not self.stage1_only,
@@ -1035,11 +1042,11 @@ class FMNeRD(nn.Module):
         self.freq_indices = data["freq_indices"].to(self.device)
         self.mask = data["mask"].to(self.device)
         self.label_syn = data["label_syn"].to(self.device)
-        self.class_mean = data["class_mean"]
-        self.diag_refs = data.get("diag_refs", torch.zeros(0))
+        self.class_mean = data["class_mean"].to(self.device)
+        self.diag_refs = data.get("diag_refs", torch.zeros(0)).to(self.device)
         self.diag_ref_labels = data.get(
             "diag_ref_labels", torch.zeros(0, dtype=torch.long)
-        )
+        ).to(self.device)
         self.refs_per_class = int(data.get("refs_per_class", 0))
         cfg = data.get("config", {})
         if "num_per_class" in cfg:
