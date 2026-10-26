@@ -1,4 +1,9 @@
 .DS_Store
 ALGORITHM.md
 *.pyc
-data
+__pycache__/
+data/
+buffers/
+results/
+logs
+tests

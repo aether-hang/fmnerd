@@ -1,21 +1,33 @@
+"""Trajectory matching (MTT/TM) with the FM-NeRD parameterisation.
+
+The outer/inner training loop, DSA augmentation, ReparamModule teacher and
+evaluation protocol are the DDiF ``TM/main_TM.py`` implementation.  Only the
+synthetic-data module is replaced by ``fmnerd.FMNeRD``.
+"""
+
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
 import argparse
 import random
-import shutil
 import sys
 import warnings
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.utils
+import matplotlib.pyplot as plt
+
 from tqdm import tqdm
 
-from utils import (
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from utils import (  # noqa: E402
     DiffAugment,
     ParamDiffAug,
     evaluate_synset,
@@ -26,59 +38,52 @@ from utils import (
     save_and_print,
     set_seed,
 )
-from reparam_module import ReparamModule
-from hyper_params import default_renderer, load_default
+from reparam_module import ReparamModule  # noqa: E402
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from fmnerd import FMNeRD  # noqa: E402
+from fmnerd.cli import add_common_args, add_fmnerd_args, finalize_args  # noqa: E402
+from fmnerd.factory import build_synset  # noqa: E402
+from fmnerd.runner import collect_real_dataset  # noqa: E402
+from fmnerd.snapshot import save_snapshot  # noqa: E402
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-def build_synset(args, channel, im_size, num_classes):
-    if args.dim_hidden is None:
-        code_dim = args.freq_dim if args.freq_dim > 0 else 512
-        renderer_cfg = default_renderer(
-            channel, num_classes, im_size[0], im_size[1], args.ipc,
-            code_dim=code_dim,
-        )
-    else:
-        renderer_cfg = {
-            "dim_hidden": args.dim_hidden,
-            "dim_local": args.dim_local,
-            "num_layers": args.num_layers,
-        }
-    logger = lambda msg: save_and_print(args.log_path, msg)  # noqa: E731
-    synset = FMNeRD(
-        channel=channel,
-        num_classes=num_classes,
-        im_size=im_size,
-        ipc=args.ipc,
-        device=args.device,
-        freq_dim=args.freq_dim if args.freq_dim > 0 else None,
-        per_channel=args.per_channel,
-        class_wise_mask=args.mask_mode == "classwise",
-        init_mode=getattr(args, "init_mode", "real"),
-        lambda_fisher=args.lambda_fisher,
-        dipc=args.dipc,
-        dim_hidden=renderer_cfg["dim_hidden"],
-        dim_local=renderer_cfg["dim_local"],
-        num_layers=renderer_cfg["num_layers"],
-        w0=args.w0,
-        w0_first=args.w0_first,
-        residual_alpha=getattr(args, "residual_alpha", 0.05),
-        warmup_steps=args.warmup_steps,
-        lr_code=args.lr_code,
-        lr_siren=args.lr_siren,
-        lambda_prior=args.lambda_prior,
-        lambda_res=args.lambda_res,
-        init_chunk=args.init_chunk,
-        decode_chunk=args.decode_chunk,
-        seed=args.seed,
-        logger=logger,
-    )
-    return synset
+def load_expert_files(args):
+    expert_dir = os.path.join(args.buffer_path, args.dataset)
+    if args.dataset == "ImageNet":
+        expert_dir = os.path.join(expert_dir, args.subset)
+    if not args.zca:
+        expert_dir += "_NO_ZCA"
+    expert_dir = os.path.join(expert_dir, args.model)
+    save_and_print(args.log_path, "Expert Dir: {}".format(expert_dir))
+
+    if args.load_all:
+        buffer = []
+        n = 0
+        while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
+            buffer += torch.load(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)))
+            n += 1
+        if n == 0:
+            raise AssertionError("No buffers detected at {}".format(expert_dir))
+        return buffer, None, None
+
+    expert_files = []
+    n = 0
+    while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
+        expert_files.append(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)))
+        n += 1
+    if n == 0:
+        raise AssertionError("No buffers detected at {}".format(expert_dir))
+    random.shuffle(expert_files)
+    if args.max_files is not None:
+        expert_files = expert_files[: args.max_files]
+    save_and_print(args.log_path, "loading file {}".format(expert_files[0]))
+    buffer = torch.load(expert_files[0])
+    if args.max_experts is not None:
+        buffer = buffer[: args.max_experts]
+    random.shuffle(buffer)
+    return buffer, expert_files, 0
 
 
 def main(args):
@@ -90,8 +95,10 @@ def main(args):
 
     save_and_print(args.log_path, "CUDNN STATUS: {}".format(torch.backends.cudnn.enabled))
 
-    args.dsa = args.dsa if isinstance(args.dsa, bool) else (args.dsa == "True")
-    args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    args.dsa = bool(args.dsa)
+    args.dsa_param = ParamDiffAug()
+    args.dc_aug_param = None if args.dsa else {}
+    args.distributed = False
 
     eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()
     (
@@ -108,302 +115,134 @@ def main(args):
         class_map,
         class_map_inv,
     ) = get_dataset(args.dataset, args.data_path, args.batch_real, args.subset, args=args)
-    args.channel, args.im_size, args.num_classes, args.mean, args.std = (
-        channel,
-        im_size,
-        num_classes,
-        mean,
-        std,
-    )
+    args.channel, args.im_size, args.num_classes = channel, im_size, num_classes
+    args.mean, args.std = mean, std
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
-    args.im_size = im_size
-
-    accs_all_exps = {key: [] for key in model_eval_pool}
-
-    if not hasattr(args, "dc_aug_param"):
-        args.dc_aug_param = None
-    if args.dsa:
-        args.dc_aug_param = None
-
-    args.dsa_param = ParamDiffAug()
-    dsa_params = args.dsa_param
-    if args.zca:
-        zca_trans = args.zca_trans
-    else:
-        zca_trans = None
-    args.dsa_param = dsa_params
-    args.zca_trans = zca_trans
-
-    args.distributed = torch.cuda.device_count() > 1
 
     save_and_print(args.log_path, "Hyper-parameters: {}".format(args.__dict__))
     save_and_print(args.log_path, "Evaluation model pool: {}".format(model_eval_pool))
 
-    # ------------------------------------------------------------------
-    # Organise the real dataset (same as FreD / DDiF)
-    # ------------------------------------------------------------------
-    images_all = []
-    labels_all = []
-    indices_class = [[] for _ in range(num_classes)]
-    save_and_print(args.log_path, "BUILDING DATASET")
-    for i in tqdm(range(len(dst_train))):
-        sample = dst_train[i]
-        images_all.append(torch.unsqueeze(sample[0], dim=0))
-        label = int(sample[1])
-        if class_map is not None and label in class_map:
-            # ImageNet's get_dataset() may already remap labels to 0..C-1.
-            label = int(class_map[label])
-        if not 0 <= label < num_classes:
-            raise ValueError(
-                "label {} is outside [0, {}) and is not in class_map".format(
-                    label, num_classes
-                )
-            )
-        labels_all.append(label)
+    images_all, labels_all, indices_class = collect_real_dataset(
+        dst_train, class_map, num_classes
+    )
+    save_and_print(
+        args.log_path,
+        "Real dataset: {} images | {} classes | shape {}x{}x{}".format(
+            images_all.shape[0], num_classes, channel, *im_size
+        ),
+    )
 
-    for i, lab in tqdm(enumerate(labels_all)):
-        indices_class[lab].append(i)
-    images_all = torch.cat(images_all, dim=0).to("cpu")
-    labels_all = torch.tensor(labels_all, dtype=torch.long, device="cpu")
-
-    # ------------------------------------------------------------------
-    # Initialise FM-NeRD
-    # ------------------------------------------------------------------
-    synset = build_synset(args, channel, im_size, num_classes)
-    synset.initialize_from_dataset(images_all, labels_all, save_dir=args.save_path)
+    synset = build_synset(args, channel, im_size, num_classes, logger=print)
+    synset.initialize_from_dataset(images_all, labels_all, indices_class)
 
     if args.batch_syn == 0:
         args.batch_syn = synset.num_total
     save_and_print(
         args.log_path,
-        "Inner loop: batch_syn={} | syn_steps={} | max decoded/iteration={}".format(
-            args.batch_syn, args.syn_steps, min(synset.num_total, args.batch_syn * args.syn_steps)
+        "Inner loop: batch_syn={} | syn_steps={} | decoded subset/iteration={}".format(
+            args.batch_syn,
+            args.syn_steps,
+            min(synset.num_total, args.batch_syn * args.syn_steps),
         ),
     )
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
     syn_lr = torch.tensor(args.lr_teacher, device=args.device)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
-
     criterion = nn.CrossEntropyLoss().to(args.device)
     save_and_print(args.log_path, "%s training begins" % get_time())
 
-    expert_dir = os.path.join(args.buffer_path, args.dataset)
-    if args.dataset == "ImageNet":
-        expert_dir = os.path.join(expert_dir, args.subset)
-    if not args.zca:
-        expert_dir += "_NO_ZCA"
-    expert_dir = os.path.join(expert_dir, args.model)
-    save_and_print(args.log_path, "Expert Dir: {}".format(expert_dir))
-
-    if args.load_all:
-        buffer = []
-        n = 0
-        while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
-            buffer = buffer + torch.load(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)))
-            n += 1
-        if n == 0:
-            raise AssertionError("No buffers detected at {}".format(expert_dir))
-    else:
-        expert_files = []
-        n = 0
-        while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
-            expert_files.append(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)))
-            n += 1
-        if n == 0:
-            raise AssertionError("No buffers detected at {}".format(expert_dir))
-        file_idx = 0
-        expert_idx = 0
-        random.shuffle(expert_files)
-        if args.max_files is not None:
-            expert_files = expert_files[: args.max_files]
-        save_and_print(args.log_path, "loading file {}".format(expert_files[file_idx]))
-        buffer = torch.load(expert_files[file_idx])
-        if args.max_experts is not None:
-            buffer = buffer[: args.max_experts]
-        random.shuffle(buffer)
-
+    buffer, expert_files, expert_idx = load_expert_files(args)
+    file_idx = 0
     best_acc = {m: 0 for m in model_eval_pool}
     best_std = {m: 0 for m in model_eval_pool}
-
     del images_all, labels_all
 
     for it in range(0, args.Iteration + 1):
         save_this_it = False
 
         # ------------------------------------------------------------------
-        # Evaluation
+        # Evaluation exactly as in DDiF
         # ------------------------------------------------------------------
-        if it in eval_it_pool and it != 0:
+        if it in eval_it_pool and it > 0:
             for model_eval in model_eval_pool:
                 save_and_print(
                     args.log_path,
-                    "-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d"
+                    "-------------------------\nEvaluation\n"
+                    "model_train = %s, model_eval = %s, iteration = %d"
                     % (args.model, model_eval, it),
                 )
                 if args.dsa:
-                    save_and_print(args.log_path, "DSA augmentation strategy: {}".format(args.dsa_strategy))
-                    save_and_print(args.log_path, "DSA augmentation parameters: {}".format(args.dsa_param.__dict__))
-                else:
-                    save_and_print(args.log_path, "DC augmentation parameters: {}".format(args.dc_aug_param))
-
-                accs_test = []
-                accs_train = []
-                for it_eval in range(args.num_eval):
-                    net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device)
-                    image_syn_eval, label_syn_eval = synset.get(need_copy=True)
                     save_and_print(
                         args.log_path,
-                        "Evaluate dataset size: {} {}".format(
-                            image_syn_eval.shape, label_syn_eval.shape
-                        ),
+                        "DSA augmentation strategy: {}".format(args.dsa_strategy),
                     )
-
+                accs_test = []
+                for it_eval in range(args.num_eval):
+                    net_eval = get_network(model_eval, channel, num_classes, im_size).to(
+                        args.device
+                    )
+                    image_syn_eval, label_syn_eval = synset.get(need_copy=True)
                     args.lr_net = syn_lr.item()
-                    _, acc_train, acc_test = evaluate_synset(
-                        it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args
+                    _, _, acc_test = evaluate_synset(
+                        it_eval,
+                        net_eval,
+                        image_syn_eval,
+                        label_syn_eval,
+                        testloader,
+                        args,
                     )
                     accs_test.append(acc_test)
-                    accs_train.append(acc_train)
+                    del image_syn_eval, label_syn_eval
                 accs_test = np.array(accs_test)
-                accs_train = np.array(accs_train)
-                acc_test_mean = np.mean(accs_test)
-                acc_test_std = np.std(accs_test)
+                acc_test_mean = float(np.mean(accs_test))
+                acc_test_std = float(np.std(accs_test))
                 if acc_test_mean > best_acc[model_eval]:
                     best_acc[model_eval] = acc_test_mean
                     best_std[model_eval] = acc_test_std
                     save_this_it = True
+                    torch.save(
+                        {"best_acc": best_acc, "best_std": best_std},
+                        os.path.join(args.save_path, "best_performance.pt"),
+                    )
                 save_and_print(
                     args.log_path,
-                    "Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------"
+                    "Evaluate %d random %s, mean = %.4f std = %.4f"
                     % (len(accs_test), model_eval, acc_test_mean, acc_test_std),
                 )
-                save_and_print(args.log_path, "{}".format(args.save_path))
-                save_and_print(args.log_path, "{:5d} | Accuracy/{}: {}".format(it, model_eval, acc_test_mean))
-                save_and_print(args.log_path, "{:5d} | Max_Accuracy/{}: {}".format(it, model_eval, best_acc[model_eval]))
-                save_and_print(args.log_path, "{:5d} | Std/{}: {}".format(it, model_eval, acc_test_std))
-                save_and_print(args.log_path, "{:5d} | Max_Std/{}: {}".format(it, model_eval, best_std[model_eval]))
-                del image_syn_eval, label_syn_eval
+                save_and_print(
+                    args.log_path, f"{it:5d} | Accuracy/{model_eval}: {acc_test_mean}"
+                )
+                save_and_print(
+                    args.log_path,
+                    f"{it:5d} | Max_Accuracy/{model_eval}: {best_acc[model_eval]}",
+                )
+                save_and_print(
+                    args.log_path, f"{it:5d} | Std/{model_eval}: {acc_test_std}"
+                )
+            save_and_print(
+                args.log_path, f"{it:5d} | Synthetic_LR: {syn_lr.detach().cpu()}"
+            )
 
-            save_and_print(args.log_path, "{:5d} | Synthetic_LR: {}".format(it, syn_lr.detach().cpu()))
-
-        if it in eval_it_pool and (save_this_it or it % 1000 == 0):
-            with torch.no_grad():
-                image_save, label_save = synset.get(need_copy=True)
-                save_dir = args.save_path
-
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-
-                torch.save(image_save.cpu(), os.path.join(save_dir, "images_{}.pt".format(it)))
-                torch.save(label_save.cpu(), os.path.join(save_dir, "labels_{}.pt".format(it)))
-
-                if save_this_it:
-                    torch.save(image_save.cpu(), os.path.join(save_dir, "images_best.pt"))
-                    torch.save(label_save.cpu(), os.path.join(save_dir, "labels_best.pt"))
-                    synset.save(
-                        os.path.join(save_dir, "FM_NeRD_best.pt"),
-                        auxiliary={"syn_lr": syn_lr.detach().cpu()},
-                    )
-
-                if args.ipc < 50 or args.force_save:
-                    upsampled = image_save
-                    classes_save = np.random.permutation(num_classes)[: min(10, num_classes)]
-                    indices_save = np.concatenate(
-                        [
-                            c * synset.num_per_class
-                            + np.arange(min(10, synset.num_per_class))
-                            for c in classes_save
-                        ]
-                    )
-                    upsampled = upsampled[indices_save]
-                    if args.dataset != "ImageNet":
-                        upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                        upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                    grid = torchvision.utils.make_grid(
-                        upsampled, nrow=len(classes_save), normalize=True, scale_each=True
-                    )
-                    plt.imshow(np.transpose(grid.detach().cpu().numpy(), (1, 2, 0)))
-                    plt.savefig("{}/Synthetic_Images#{}.png".format(save_dir, it), dpi=300)
-                    plt.close()
-
-                    for clip_val in [2.5]:
-                        std_v = torch.std(image_save)
-                        mean_v = torch.mean(image_save)
-                        upsampled = torch.clip(
-                            image_save, min=mean_v - clip_val * std_v, max=mean_v + clip_val * std_v
-                        )
-                        upsampled = upsampled[indices_save]
-                        if args.dataset != "ImageNet":
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                        grid = torchvision.utils.make_grid(
-                            upsampled, nrow=len(classes_save), normalize=True, scale_each=True
-                        )
-                        plt.imshow(np.transpose(grid.detach().cpu().numpy(), (1, 2, 0)))
-                        plt.savefig("{}/Clipped_Synthetic_Images#{}.png".format(save_dir, it), dpi=300)
-                        plt.close()
-
-                    if args.zca:
-                        image_save = image_save.to(args.device)
-                        image_save = args.zca_trans.inverse_transform(image_save)
-                        image_save.cpu()
-
-                        torch.save(
-                            image_save.cpu(), os.path.join(save_dir, "images_zca_{}.pt".format(it))
-                        )
-
-                        upsampled = image_save
-                        upsampled = upsampled[indices_save]
-                        if args.dataset != "ImageNet":
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                        grid = torchvision.utils.make_grid(
-                            upsampled, nrow=len(classes_save), normalize=True, scale_each=True
-                        )
-                        plt.imshow(np.transpose(grid.detach().cpu().numpy(), (1, 2, 0)))
-                        plt.savefig("{}/Reconstructed_Images#{}.png".format(save_dir, it), dpi=300)
-                        plt.close()
-
-                        for clip_val in [2.5]:
-                            std_v = torch.std(image_save)
-                            mean_v = torch.mean(image_save)
-                            upsampled = torch.clip(
-                                image_save,
-                                min=mean_v - clip_val * std_v,
-                                max=mean_v + clip_val * std_v,
-                            )
-                            upsampled = upsampled[indices_save]
-                            if args.dataset != "ImageNet":
-                                upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                                upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                            grid = torchvision.utils.make_grid(
-                                upsampled, nrow=len(classes_save), normalize=True, scale_each=True
-                            )
-                            plt.imshow(np.transpose(grid.detach().cpu().numpy(), (1, 2, 0)))
-                            plt.savefig(
-                                "{}/Clipped_Reconstructed_Images#{}.png".format(save_dir, it),
-                                dpi=300,
-                            )
-                            plt.close()
-
-                    del image_save, label_save, upsampled
+            save_snapshot(
+                synset,
+                args.save_path,
+                it,
+                save_best=save_this_it,
+                dataset=args.dataset,
+                auxiliary={"syn_lr": syn_lr.detach().cpu()},
+                force_save=args.force_save,
+            )
 
         # ------------------------------------------------------------------
-        # One MTT outer step
+        # Teacher trajectory sample (DDiF)
         # ------------------------------------------------------------------
-        synset.on_train_step(it)
-
-        student_net = get_network(args.model, channel, num_classes, im_size, dist=False).to(args.device)
+        student_net = get_network(args.model, channel, num_classes, im_size, dist=False).to(
+            args.device
+        )
         student_net = ReparamModule(student_net)
-        if args.distributed:
-            student_net = torch.nn.DataParallel(student_net)
         student_net.train()
-
-        num_params = sum([np.prod(p.size()) for p in (student_net.parameters())])
+        num_params = sum([np.prod(p.size()) for p in student_net.parameters()])
 
         if args.load_all:
             expert_trajectory = buffer[np.random.randint(0, len(buffer))]
@@ -425,192 +264,92 @@ def main(args):
 
         start_epoch = np.random.randint(0, args.max_start_epoch)
         starting_params = expert_trajectory[start_epoch]
-
         target_params = expert_trajectory[start_epoch + args.expert_epochs]
-        target_params = torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
-
+        target_params = torch.cat(
+            [p.data.to(args.device).reshape(-1) for p in target_params], 0
+        )
         student_params = [
-            torch.cat([p.data.to(args.device).reshape(-1) for p in starting_params], 0).requires_grad_(True)
+            torch.cat(
+                [p.data.to(args.device).reshape(-1) for p in starting_params], 0
+            ).requires_grad_(True)
         ]
+        starting_params = torch.cat(
+            [p.data.to(args.device).reshape(-1) for p in starting_params], 0
+        )
 
-        starting_params = torch.cat([p.data.to(args.device).reshape(-1) for p in starting_params], 0)
-
-        # Decode only the samples used by this MTT iteration (bounded memory).
-        _, image_syn, label_syn, aux = synset.get_for_training(args.syn_steps, args.batch_syn)
+        indices_total = torch.randperm(synset.num_total, device=synset.device)[
+            : min(synset.num_total, args.syn_steps * args.batch_syn)
+        ]
+        image_syn, label_syn = synset.get(indices_total)
+        aux_total, aux_metrics = synset.auxiliary_losses(
+            image_syn, indices_total, it
+        )
         syn_images = image_syn
         y_hat = label_syn.to(args.device)
-
-        param_loss_list = []
-        param_dist_list = []
         indices_chunks = []
 
         for step in range(args.syn_steps):
             if not indices_chunks:
                 indices = torch.randperm(len(syn_images))
                 indices_chunks = list(torch.split(indices, args.batch_syn))
-
             these_indices = indices_chunks.pop()
 
             x = syn_images[these_indices]
             this_y = y_hat[these_indices]
-
             if args.dsa and (not args.no_aug):
                 x = DiffAugment(x, args.dsa_strategy, param=args.dsa_param)
 
-            if args.distributed:
-                forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
-            else:
-                forward_params = student_params[-1]
-            x = student_net(x, flat_param=forward_params)
+            x = student_net(x, flat_param=student_params[-1])
             ce_loss = criterion(x, this_y)
-
-            grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
-
+            grad = torch.autograd.grad(
+                ce_loss, student_params[-1], create_graph=True
+            )[0]
             student_params.append(student_params[-1] - syn_lr * grad)
 
-        param_loss = torch.tensor(0.0).to(args.device)
-        param_dist = torch.tensor(0.0).to(args.device)
+        param_loss = torch.nn.functional.mse_loss(
+            student_params[-1], target_params, reduction="sum"
+        )
+        param_dist = torch.nn.functional.mse_loss(
+            starting_params, target_params, reduction="sum"
+        )
+        param_loss = param_loss / num_params
+        param_dist = param_dist / num_params
+        grand_loss = param_loss / param_dist
+        total_loss = grand_loss + aux_total
 
-        param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
-        param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
-
-        param_loss_list.append(param_loss)
-        param_dist_list.append(param_dist)
-
-        param_loss /= num_params
-        param_dist /= num_params
-
-        param_loss /= param_dist
-
-        grand_loss = param_loss
-        prior_value = 0.0
-        residual_value = 0.0
-        if args.lambda_prior != 0.0 or args.lambda_res != 0.0:
-            prior, residual = synset.regularization(aux, label_syn)
-            prior_value = float(prior.detach().cpu())
-            residual_value = float(residual.detach().cpu())
-            grand_loss = (
-                grand_loss
-                + args.lambda_prior * prior
-                + args.lambda_res * residual
-            )
-
+        synset.on_train_step(it, args.Iteration)
         synset.optim_zero_grad()
         optimizer_lr.zero_grad()
-
-        grand_loss.backward()
-
+        total_loss.backward()
+        synset.log_grad_norms(it, args.grad_every)
         synset.optim_step()
         optimizer_lr.step()
+        syn_lr.data = syn_lr.data.clip(min=0.001)
 
-        syn_lr.data = syn_lr.data.clip(min=0.001)  # avoid invalid syn_lr (HaBa)
+        synset.log_iteration(it, grand_loss.item(), aux_metrics, args.log_every)
+        synset.heavy_diagnostics(
+            it,
+            mod_every=args.mod_every,
+            freq_every=args.freq_diag_every,
+            share_every=args.share_diag_every,
+        )
 
         for _ in student_params:
             del _
 
-        if it % 10 == 0:
-            save_and_print(
-                args.log_path,
-                "%s iter = %04d, loss = %.4f, prior = %.4f, res = %.4f, lr = %.5f"
-                % (
-                    get_time(),
-                    it,
-                    grand_loss.item(),
-                    prior_value,
-                    residual_value,
-                    syn_lr.item(),
-                ),
-            )
-
-
-def str2bool(value):
-    if isinstance(value, bool):
-        return value
-    value = value.lower()
-    if value in ("true", "1", "yes"):
-        return True
-    if value in ("false", "0", "no"):
-        return False
-    raise argparse.ArgumentTypeError("Expected a boolean value, got {}".format(value))
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FM-NeRD trajectory matching")
-
-    # Dataset / model
-    parser.add_argument("--dataset", type=str, default="CIFAR10")
-    parser.add_argument("--subset", type=str, default="imagenette")
-    parser.add_argument("--res", type=int, default=128, help="ImageNet subset resolution")
-    parser.add_argument("--model", type=str, default="ConvNet")
-    parser.add_argument("--ipc", type=int, default=1, help="budget images per class")
-    parser.add_argument("--eval_mode", type=str, default="S")
-    parser.add_argument("--num_eval", type=int, default=5)
-    parser.add_argument("--eval_it", type=int, default=500)
-    parser.add_argument("--epoch_eval_train", type=int, default=1000)
-    parser.add_argument("--Iteration", type=int, default=15000)
-    parser.add_argument("--lr_init", type=float, default=0.01)
-    parser.add_argument("--batch_real", type=int, default=256)
-    parser.add_argument("--batch_train", type=int, default=256)
-    parser.add_argument("--dsa", type=str, default="True", choices=["True", "False"])
-    parser.add_argument("--dsa_strategy", type=str, default="color_crop_cutout_flip_scale_rotate")
-    parser.add_argument("--data_path", type=str, default="../data")
-    parser.add_argument("--buffer_path", type=str, default="../buffers")
-    parser.add_argument("--zca", action="store_true")
-    parser.add_argument("--load_all", action="store_true")
-    parser.add_argument("--no_aug", type=str2bool, default=False)
-    parser.add_argument("--max_files", type=int, default=None)
-    parser.add_argument("--max_experts", type=int, default=None)
-    parser.add_argument("--force_save", action="store_true")
-    parser.add_argument("--detect_anomaly", action="store_true")
-
-    # Bookkeeping
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--sh_file", type=str, default="run_TM_FMNeRD.sh")
-    parser.add_argument("--FLAG", type=str, default="TEST")
-    parser.add_argument("--save_path", type=str, default="./results")
-
-    # MTT
-    parser.add_argument("--syn_steps", type=int, default=None)
-    parser.add_argument("--expert_epochs", type=int, default=None)
-    parser.add_argument("--max_start_epoch", type=int, default=None)
-    parser.add_argument("--lr_lr", type=float, default=None)
-    parser.add_argument("--lr_teacher", type=float, default=None)
-    parser.add_argument("--batch_syn", type=int, default=0)
-
-    # FM-NeRD
-    parser.add_argument("--freq_dim", type=int, default=512, help="total DCT coefficients per image (default k=512)")
-    parser.add_argument("--per_channel", type=str2bool, default=True)
-    parser.add_argument("--mask_mode", type=str, default="classwise", choices=["global", "classwise"])
-    parser.add_argument("--init_mode", type=str, default="real", choices=["kmeans", "real"])
-    parser.add_argument("--lambda_fisher", type=float, default=0.0)
-    parser.add_argument("--dipc", type=int, default=0, help="decoded images per class (0 = use full budget)")
-    parser.add_argument("--dim_hidden", type=int, default=None)
-    parser.add_argument("--dim_local", type=int, default=16, help="global modulation MLP hidden width")
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--w0", type=float, default=30.0)
-    parser.add_argument("--w0_first", type=float, default=30.0)
-    parser.add_argument("--residual_alpha", type=float, default=0.05)
-    parser.add_argument("--warmup_steps", type=int, default=0)
-    parser.add_argument("--lr_code", type=float, default=100.0)
-    parser.add_argument("--lr_siren", type=float, default=1e-3)
-    parser.add_argument("--lambda_prior", type=float, default=0.0)
-    parser.add_argument("--lambda_res", type=float, default=0.0)
-    parser.add_argument("--init_chunk", type=int, default=256)
-    parser.add_argument("--decode_chunk", type=int, default=512)
-
+    parser = add_common_args(
+        parser,
+        "TM",
+        default_iteration=15000,
+        default_eval_it=500,
+        default_epoch_eval_train=1000,
+        default_dsa=True,
+    )
+    parser = add_fmnerd_args(parser)
     args = parser.parse_args()
     set_seed(args.seed)
-    args = load_default(args)
-
-    if not os.path.exists(args.save_path):
-        os.makedirs(args.save_path)
-    args.save_path = args.save_path + "/{}".format(args.FLAG)
-    if not os.path.exists(args.save_path):
-        os.makedirs(args.save_path)
-
-    script_path = "./scripts/{}".format(args.sh_file)
-    if os.path.exists(script_path):
-        shutil.copy(script_path, "{}/{}".format(args.save_path, args.sh_file))
-    args.log_path = "{}/log.txt".format(args.save_path)
-
+    args = finalize_args(args, "TM", HERE)
     main(args)

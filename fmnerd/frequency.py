@@ -1,324 +1,215 @@
-"""Offline statistics for the Discriminative Frequency Mask (DFM).
+"""FreD-style frequency analysis, EVR masks and top-k frequency codes.
 
-Everything in this file is executed exactly once, before distillation starts:
+Two pieces are reused from FreD (``TM/main_TM_FreD.py`` and friends):
 
-1. one pass over the real dataset to accumulate per-class first / second
-   moments of the orthonormal 2D-DCT coefficients;
-2. construction of the mixed EVR + Fisher score and selection of the Top-k
-   frequency dimensions;
-3. a second pass that gathers the selected coefficients, which are used for
-   the per-class prior and for real-image initialisation of ``z_low``.
+* the per-class explained-variance-ratio (EVR) mask.  FreD computes the
+  covariance of the class frequency matrix and takes the diagonal entries
+  (``p^T Cov p`` for every one-hot ``p``), then keeps the
+  ``msz_per_channel`` spatial frequencies with the largest EVR.  Since only
+  the diagonal is ever read, we compute the exact same quantity directly as
+  the per-frequency variance across instances.  This avoids an
+  ``H*W x H*W`` covariance matrix and makes 128x128 ImageNet subsets
+  tractable.
+* the sparse top-k frequency coefficient representation.  A class mask is
+  shared by all channels (exactly as in FreD), therefore the stored code has
+  ``k = channel * msz_per_channel`` real numbers.
 
-The second pass is cheaper than keeping the whole frequency matrix in memory
-(``N x C x H x W``), which matters for 128x128 subsets.
+The mask is represented twice: as a ``[num_classes, C, H, W]`` binary tensor
+(for visualization / compatibility) and as flat ``[num_classes, k]`` indices
+into the ``C*H*W`` spectrum (used for fast gathering).
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
-
+import numpy as np
 import torch
 
 from .dct import dct_2d
 
 
-def collect_spectral_moments(
-    images: torch.Tensor,
-    labels: torch.Tensor,
-    num_classes: int,
-    mat_h: torch.Tensor,
-    mat_w: torch.Tensor,
-    chunk_size: int = 256,
-) -> dict:
-    """Accumulate per-class mean / second moment of every frequency dimension.
+def _check_images(images):
+    if images.ndim != 4:
+        raise ValueError("images must be [N, C, H, W], got {}".format(tuple(images.shape)))
+
+
+def build_class_evr_masks(
+    images,
+    labels,
+    num_classes,
+    msz_per_channel,
+    mat_h,
+    mat_w,
+    chunk_size=64,
+    eps=1e-12,
+):
+    """Compute per-class EVR masks and top-k flat frequency indices.
 
     Args:
-        images: CPU tensor ``[N, C, H, W]`` (already normalised like the real
-            training set).
-        labels: CPU tensor ``[N]`` with values in ``[0, num_classes)``.
-        mat_h / mat_w: cached orthonormal DCT matrices.
-        chunk_size: number of images transformed at once.
+        images: CPU tensor ``[N, C, H, W]`` with already-normalized pixels.
+        labels: CPU tensor ``[N]`` in ``[0, num_classes)``.
+        msz_per_channel: number of spatial frequencies kept per class.  The
+            same ``(h, w)`` positions are enabled on every channel, matching
+            FreD's ``msz_per_channel`` budget semantics.
+        mat_h / mat_w: orthonormal DCT matrices.
 
     Returns:
-        dict with ``sums`` / ``sumsq`` (float64, ``[C_num, D]``) and
-        ``counts`` (int64, ``[C_num]``), where ``D = C*H*W``.
+        mask: ``[num_classes, C, H, W]`` float32 binary mask.
+        indices: ``[num_classes, C * msz_per_channel]`` int64 flat indices.
+        evr: ``[num_classes, H * W]`` explained variance ratios (diagnostics).
     """
-    if images.ndim != 4:
-        raise ValueError("images must be [N, C, H, W]")
+    _check_images(images)
+    channel, height, width = images.shape[1:]
+    hw = height * width
+    if not 1 <= int(msz_per_channel) <= hw:
+        raise ValueError(
+            "msz_per_channel must be in [1, {}], got {}".format(hw, msz_per_channel)
+        )
+    msz = int(msz_per_channel)
     device = mat_h.device
-    numel = images.shape[1] * images.shape[2] * images.shape[3]
-    sums = torch.zeros(num_classes, numel, dtype=torch.float64, device=device)
+
+    # Per-instance channel-mean spectrum, accumulated as first/second moments.
+    sums = torch.zeros(num_classes, hw, dtype=torch.float64, device=device)
     sumsq = torch.zeros_like(sums)
     counts = torch.zeros(num_classes, dtype=torch.int64, device=device)
 
     with torch.no_grad():
-        for start in range(0, images.shape[0], chunk_size):
-            x = images[start : start + chunk_size].to(device, non_blocking=True)
-            y = labels[start : start + chunk_size].to(device)
-            freq = dct_2d(x, mat_h, mat_w).reshape(x.shape[0], -1)
+        for start in range(0, images.shape[0], int(chunk_size)):
+            x = images[start : start + int(chunk_size)].to(device, non_blocking=True)
+            y = labels[start : start + int(chunk_size)].to(device)
+            freq = dct_2d(x, mat_h, mat_w)                  # [B, C, H, W]
+            freq = freq.mean(dim=1).reshape(x.shape[0], hw)  # FreD averages RGB
             freq64 = freq.to(torch.float64)
             sums.index_add_(0, y, freq64)
             sumsq.index_add_(0, y, freq64 * freq64)
-            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.int64))
+            counts.index_add_(0, y, torch.ones_like(y))
 
-    if (counts == 0).any():
-        raise ValueError("Every class must contain at least one real sample.")
-    return {"sums": sums, "sumsq": sumsq, "counts": counts}
+    if bool((counts == 0).any()):
+        raise ValueError("Every class must contain at least one real sample")
+
+    n = counts.to(torch.float64).unsqueeze(1)
+    mean = sums / n
+    var = (sumsq / n - mean * mean).clamp_min_(0.0)
+    evr = var / (var.sum(dim=1, keepdim=True) + eps)
+
+    top = torch.topk(evr, msz, dim=1).indices                 # [Cnum, msz]
+    spatial_h = torch.div(top, width, rounding_mode="floor")
+    spatial_w = top % width
+
+    # Same (h, w) is enabled for every channel, as in FreD.
+    per_channel = [
+        (spatial_h * width + spatial_w) + c * hw
+        for c in range(channel)
+    ]
+    flat = torch.cat(per_channel, dim=1)                      # [Cnum, C*msz]
+    flat = flat.sort(dim=1).values.long()
+
+    indices = flat.cpu()
+    mask = torch.zeros(num_classes, channel, height, width, dtype=torch.float32)
+    rows = torch.arange(num_classes).unsqueeze(1)
+    mask_flat = mask.view(num_classes, channel * hw)
+    # flat is sorted, but scatter is idempotent if duplicates existed.
+    mask_flat[rows, indices] = 1.0
+    mask = mask_flat.view(num_classes, channel, height, width).contiguous()
+
+    return mask, indices.contiguous(), evr.cpu()
 
 
-def collect_selected_coefficients(
-    images: torch.Tensor,
-    labels: torch.Tensor,
-    freq_indices: torch.Tensor,
-    num_classes: int,
-    mat_h: torch.Tensor,
-    mat_w: torch.Tensor,
-    chunk_size: int = 256,
-) -> List[torch.Tensor]:
-    """Gather the selected DCT coefficients for every real sample.
-
-    Args:
-        freq_indices: ``[k]`` (global mask) or ``[C_num, k]`` (class-wise mask).
-
-    Returns:
-        A list of ``num_classes`` CPU tensors, each ``[N_c, k]`` float32.
-    """
-    device = mat_h.device
-    class_wise = freq_indices.ndim == 2
-    buckets: List[List[torch.Tensor]] = [[] for _ in range(num_classes)]
-
-    with torch.no_grad():
-        for start in range(0, images.shape[0], chunk_size):
-            x = images[start : start + chunk_size].to(device, non_blocking=True)
-            y = labels[start : start + chunk_size].to(device)
-            freq = dct_2d(x, mat_h, mat_w).reshape(x.shape[0], -1)
-            for c in range(num_classes):
-                mask = y == c
-                if not bool(mask.any()):
-                    continue
-                idx = freq_indices[c] if class_wise else freq_indices
-                buckets[c].append(freq[mask][:, idx].to(torch.float32).cpu())
-
-    out: List[torch.Tensor] = []
+def choose_real_init_indices(indices_class, num_per_class, seed=0, num_classes=None):
+    """Pick ``num_per_class`` real images per class with a deterministic RNG."""
+    if num_classes is None:
+        num_classes = len(indices_class)
+    out = []
     for c in range(num_classes):
-        if not buckets[c]:
-            raise ValueError("Class {} has no samples.".format(c))
-        out.append(torch.cat(buckets[c], dim=0))
-    return out
+        pool = np.asarray(indices_class[c])
+        if pool.size == 0:
+            raise ValueError("Class {} has no real samples".format(c))
+        gen = np.random.RandomState(int(seed) + 1009 * c)
+        if pool.size >= num_per_class:
+            chosen = gen.choice(pool, size=num_per_class, replace=False)
+        else:
+            # Keep the code total under an unusually huge budget.
+            chosen = gen.choice(pool, size=num_per_class, replace=True)
+        out.append(torch.as_tensor(chosen, dtype=torch.long))
+    return torch.cat(out, dim=0)
 
 
-def build_frequency_scores(
-    moments: dict,
-    lambda_fisher: float = 0.3,
-    class_wise: bool = False,
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    """Mixed score ``(1 - lambda) * EVR + lambda * Fisher`` per dimension.
-
-    Returns ``[D]`` for a global mask or ``[C_num, D]`` for a class-wise mask.
-    For the class-wise variant the Fisher term is the global discriminative
-    term and the EVR term is computed inside each class.
-    """
-    if not 0.0 <= lambda_fisher <= 1.0:
-        raise ValueError("lambda_fisher must be in [0, 1]")
-
-    sums = moments["sums"]
-    sumsq = moments["sumsq"]
-    counts = moments["counts"].to(torch.float64)
-
-    mean_c = sums / counts.unsqueeze(1)                       # [C, D]
-    var_c = (sumsq / counts.unsqueeze(1) - mean_c * mean_c).clamp_min_(0.0)
-    mean_g = sums.sum(0) / counts.sum()
-    var_g = (sumsq.sum(0) / counts.sum() - mean_g * mean_g).clamp_min_(0.0)
-
-    evr = var_g / (var_g.sum() + eps)
-
-    # Fisher score (between-class / within-class) for every dimension.
-    between = (counts.unsqueeze(1) * (mean_c - mean_g).pow(2)).sum(0)
-    within = (sumsq - counts.unsqueeze(1) * mean_c.pow(2)).sum(0).clamp_min_(0.0)
-    fisher = between / (within + eps)
-    fisher = fisher / (fisher.sum() + eps)
-
-    if not class_wise:
-        return (1.0 - lambda_fisher) * evr + lambda_fisher * fisher
-
-    evr_c = var_c / (var_c.sum(1, keepdim=True) + eps)
-    return (1.0 - lambda_fisher) * evr_c + lambda_fisher * fisher.unsqueeze(0)
-
-
-def select_topk_indices(
-    scores: torch.Tensor,
-    freq_dim: int,
-    per_channel: bool,
-    channel: int,
-    height: int,
-    width: int,
-) -> torch.Tensor:
-    """Select the ``freq_dim`` highest-scoring frequency dimensions.
+def extract_selected(freq, indices, labels):
+    """Gather the class-selected coefficients from a DCT tensor.
 
     Args:
-        scores: ``[D]`` or ``[C_num, D]``.
-        freq_dim: total number of coefficients kept per synthetic image.
-        per_channel: if True, allocate ``freq_dim / channel`` coefficients to
-            every input channel (FreD-style).  This avoids an unbalanced mask
-            that keeps almost all coefficients of a single colour channel.
-        channel, height, width: shape of the frequency grid.
+        freq: ``[B, C, H, W]`` DCT coefficients.
+        indices: ``[Cnum, k]`` flat indices.
+        labels: ``[B]`` class labels.
 
     Returns:
-        ``[freq_dim]`` or ``[C_num, freq_dim]`` int64 indices into the flat
-        ``C*H*W`` spectrum.
+        ``[B, k]`` selected coefficients.
     """
-    numel = channel * height * width
-    if scores.shape[-1] != numel:
-        raise ValueError("scores has {} dims, expected {}".format(scores.shape[-1], numel))
-    if freq_dim <= 0 or freq_dim > numel:
-        raise ValueError("freq_dim must be in [1, {}], got {}".format(numel, freq_dim))
-
-    hw = height * width
-    lead = scores.shape[:-1]
-    view = scores.reshape(*(lead + (channel, hw)))
-
-    if per_channel:
-        # Allocate an almost equal quota per channel.  This also supports
-        # k=512 on RGB data, where a strict equal split is impossible.
-        base = freq_dim // channel
-        remainder = freq_dim % channel
-        channel_indices = []
-        for ch in range(channel):
-            kc = base + (1 if ch < remainder else 0)
-            if kc == 0:
-                continue
-            idx = torch.topk(view[..., ch, :], kc, dim=-1).indices
-            channel_indices.append(idx + ch * hw)
-        flat = torch.cat(channel_indices, dim=-1)
-    else:
-        flat = torch.topk(scores, freq_dim, dim=-1).indices
-
-    return flat.sort(dim=-1).values.long()
+    if freq.ndim != 4:
+        raise ValueError("freq must be [B, C, H, W]")
+    flat = freq.reshape(freq.shape[0], -1)
+    batch_idx = torch.arange(freq.shape[0], device=freq.device).unsqueeze(1)
+    return flat[batch_idx, indices[labels]]
 
 
-def kmeans(
-    x: torch.Tensor,
-    k: int,
-    iters: int = 50,
-    seed: int = 0,
-    tol: float = 1e-6,
-) -> torch.Tensor:
-    """Small deterministic K-Means (k-means++ init) used once per class.
+def compute_masks_and_codes(
+    images,
+    labels,
+    indices_class,
+    num_per_class,
+    num_classes,
+    msz_per_channel,
+    mat_h,
+    mat_w,
+    seed=0,
+    chunk_size=64,
+):
+    """Build masks, pick real init images and extract their top-k codes.
 
-    Implemented with plain torch so that no extra dependency (sklearn) is
-    required and the result is exactly reproducible on CPU.
+    Returns:
+        mask, indices, evr, init_indices, init_images (CPU), init_codes.
     """
-    if x.ndim != 2:
-        raise ValueError("x must be [N, d]")
-    n, d = x.shape
-    if k <= 0:
-        raise ValueError("k must be positive")
-    if k == 1:
-        return x.mean(0, keepdim=True)
-
-    x = x.detach().to(torch.float32).cpu()
-    gen = torch.Generator().manual_seed(int(seed))
-
-    if k >= n:
-        # Not expected under a sane budget, but keep the code total.
-        centers = x.clone()
-        if k > n:
-            extra_idx = torch.randint(n, (k - n,), generator=gen)
-            noise = 1e-3 * torch.randn(k - n, d, generator=gen)
-            centers = torch.cat([centers, x[extra_idx] + noise], dim=0)
-        return centers
-
-    # ---- k-means++ initialisation -------------------------------------
-    first = torch.randint(n, (1,), generator=gen).item()
-    centers = [x[first]]
-    dist = (x - centers[0]).pow(2).sum(1)
-    for _ in range(1, k):
-        total = dist.sum()
-        if float(total) <= 0.0:
-            idx = torch.randint(n, (1,), generator=gen).item()
-        else:
-            idx = torch.multinomial(dist, 1, generator=gen).item()
-        centers.append(x[idx])
-        dist = torch.minimum(dist, (x - x[idx]).pow(2).sum(1))
-    centers = torch.stack(centers, 0)                            # [k, d]
-
-    # ---- Lloyd iterations ---------------------------------------------
-    for _ in range(iters):
-        d2 = torch.cdist(x, centers)                             # [n, k]
-        assign = d2.argmin(1)
-        counts = torch.bincount(assign, minlength=k).to(x.dtype)
-        new_centers = torch.zeros_like(centers)
-        new_centers.index_add_(0, assign, x)
-        nonempty = counts > 0
-        new_centers[nonempty] /= counts[nonempty].unsqueeze(1)
-
-        if not bool(nonempty.all()):
-            # Re-seed empty clusters at the currently worst-represented points.
-            num_empty = int((~nonempty).sum())
-            assigned_dist = d2.gather(1, assign.view(-1, 1)).squeeze(1)
-            far = torch.topk(assigned_dist, num_empty).indices
-            new_centers[~nonempty] = x[far]
-
-        shift = (new_centers - centers).norm()
-        centers = new_centers
-        if float(shift) <= tol:
-            break
-
-    return centers
+    mask, indices, evr = build_class_evr_masks(
+        images,
+        labels,
+        num_classes=num_classes,
+        msz_per_channel=msz_per_channel,
+        mat_h=mat_h,
+        mat_w=mat_w,
+        chunk_size=chunk_size,
+    )
+    init_indices = choose_real_init_indices(
+        indices_class, num_per_class, seed=seed, num_classes=num_classes
+    )
+    init_images = images[init_indices].float().cpu()
+    with torch.no_grad():
+        freq = dct_2d(init_images.to(mat_h.device), mat_h, mat_w)
+        init_codes = extract_selected(freq, indices, labels[init_indices]).float().cpu()
+    return mask, indices, evr.cpu(), init_indices, init_images, init_codes
 
 
-def initialise_codes(
-    per_class_coeffs: Sequence[torch.Tensor],
-    dipc: int,
-    seed: int = 0,
-    mode: str = "real",
-) -> torch.Tensor:
-    """Initialise the low-frequency codes.
+def topk_amplitude_mse(pred_dct, target_codes, freq_indices, labels):
+    """Per-sample top-k amplitude MSE and the signed residual.
 
     Args:
-        per_class_coeffs: selected DCT coefficients for every real sample,
-            grouped by class.  Each tensor has shape ``[N_c, k]``.
-        dipc: number of decoded images per class.
-        seed: deterministic sampling / initialisation seed.
-        mode: ``"kmeans"`` uses K-Means centres; ``"real"`` samples actual
-            real-image coefficients, matching FreD's real-image initialisation.
+        pred_dct: ``[B, C, H, W]`` DCT of decoded images.
+        target_codes: ``[B, k]`` learnable / reference frequency codes.
+        freq_indices: ``[Cnum, k]`` flat indices.
+        labels: ``[B]``.
 
-    Returns ``[C_num * dipc, k]`` ordered class-major, matching ``label_syn``.
+    Returns:
+        residual: ``[B, k]`` squared amplitude error.
+        mse: scalar mean over all entries.
     """
-    mode = str(mode).lower()
-    if mode not in ("kmeans", "real"):
-        raise ValueError("init mode must be 'kmeans' or 'real', got {!r}".format(mode))
-
-    centers = []
-    for c, coeff in enumerate(per_class_coeffs):
-        gen = torch.Generator().manual_seed(seed + 1000 * c)
-        if mode == "kmeans":
-            centers.append(kmeans(coeff, dipc, seed=seed + 1000 * c))
-            continue
-
-        n = int(coeff.shape[0])
-        if n <= 0:
-            raise ValueError("Class {} has no coefficients".format(c))
-        if n >= dipc:
-            indices = torch.randperm(n, generator=gen)[:dipc]
-        else:
-            # Rare under a sane budget; keep the code total rather than fail.
-            indices = torch.randint(n, (dipc,), generator=gen)
-        centers.append(coeff[indices].clone().to(torch.float32))
-    return torch.cat(centers, dim=0).to(torch.float32)
+    pred = extract_selected(pred_dct, freq_indices, labels)
+    residual = (pred.abs() - target_codes.detach().abs()).pow(2)
+    return residual, residual.mean()
 
 
-def gaussian_prior_stats(
-    per_class_coeffs: Sequence[torch.Tensor],
-    eps: float = 1e-6,
-) -> tuple:
-    """Per-class mean and std of the selected coefficients.
-
-    Returns ``mu`` / ``sigma`` with shape ``[C_num, k]``.
-    """
-    mus, sigmas = [], []
-    for coeff in per_class_coeffs:
-        mus.append(coeff.mean(0))
-        sigmas.append(coeff.std(0, unbiased=False).clamp_min(eps))
-    return torch.stack(mus, 0), torch.stack(sigmas, 0)
+def format_flat_index(flat_index, channel, height, width):
+    """Convert a flat ``C*H*W`` index to ``(channel, u, v)`` for logging."""
+    hw = int(height) * int(width)
+    c = int(flat_index) // hw
+    rem = int(flat_index) % hw
+    u = rem // int(width)
+    v = rem % int(width)
+    return c, u, v

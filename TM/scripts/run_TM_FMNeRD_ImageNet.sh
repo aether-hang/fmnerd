@@ -1,57 +1,36 @@
 cd ..
 cuda_id=0
 dst="ImageNet"
-subset="imagenette"
+subset="nette"
 res=128
 net="ConvNetD5"
 ipc=1
+dipc=0
 sh_file="run_TM_FMNeRD_ImageNet.sh"
 eval_mode="S"
 data_path="../data/imagenet/imagenette"
-save_path="./results"
 buffer_path="../buffers"
+save_path="../logs"
 
-batch_real=64
-batch_train=64
-num_eval=5
+# FreD's ImageNet IPC=1 budget uses 2048 coefficients/channel, which makes
+# V_c (k -> 20) far larger than the class budget.  k=192 (64/channel) is the
+# default compromise; increase --msz_per_channel for the FreD budget setting.
+msz_per_channel=64
+batch_syn=102
 Iteration=15000
-batch_syn=32
-freq_dim=512
-dipc=0
-mask_mode="classwise"
-init_mode="real"
-per_channel="True"
-lambda_fisher=0.0
-warmup_steps=0
-lr_code=100
-lr_siren=1e-3
-lambda_prior=0.0
-lambda_res=0.0
-residual_alpha=0.05
+eval_it=500
 
-TAG="full"
-FLAG="${dst}_${subset}_${res}_${ipc}ipc_${net}#TM_FMNeRD_k${freq_dim}_${mask_mode}_w${warmup_steps}#${Iteration}_${lr_code}_${lr_siren}#${TAG}"
-
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 CUDA_VISIBLE_DEVICES=${cuda_id} python main_TM_FMNeRD.py \
 --dataset ${dst} --subset ${subset} --res ${res} \
 --model ${net} \
---ipc ${ipc} \
+--ipc ${ipc} --dipc ${dipc} \
 --sh_file ${sh_file} \
 --eval_mode ${eval_mode} \
---data_path ${data_path} --save_path ${save_path} --buffer_path ${buffer_path} \
---batch_real ${batch_real} --batch_train ${batch_train} \
---num_eval ${num_eval} \
---Iteration ${Iteration} \
+--data_path ${data_path} --buffer_path ${buffer_path} --save_path ${save_path} \
 --batch_syn ${batch_syn} \
---freq_dim ${freq_dim} \
---dipc ${dipc} \
---mask_mode ${mask_mode} \
---init_mode ${init_mode} \
---per_channel ${per_channel} \
---lambda_fisher ${lambda_fisher} \
---warmup_steps ${warmup_steps} \
---lr_code ${lr_code} --lr_siren ${lr_siren} \
---lambda_prior ${lambda_prior} --lambda_res ${lambda_res} \
---residual_alpha ${residual_alpha} \
---FLAG ${FLAG}
+--Iteration ${Iteration} --eval_it ${eval_it} \
+--msz_per_channel ${msz_per_channel} \
+--num_shared_layers 2 --num_cond_layers 2 \
+--stage1_steps 3000 --stage1_lr 5e-4 \
+--lr_code 5e-4 --lr_siren 1e-4 \
+--lambda_freq_target 0.1 --lambda_div 1e-3

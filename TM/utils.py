@@ -161,6 +161,12 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
         im_size = (_res, _res)
         num_classes = 10
 
+        aliases = {
+            "nette": "imagenette", "woof": "imagewoof",
+            "fruits": "imagefruit", "yellow": "imageyellow",
+            "cats": "imagemeow", "birds": "imagesquawk",
+        }
+        subset = aliases.get(subset, subset)
         config.img_net_classes = config.dict[subset]
 
         mean = [0.485, 0.456, 0.406]
@@ -175,13 +181,33 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
                                             transforms.Resize(im_size),
                                             transforms.CenterCrop(im_size)])
 
-        dst_train = datasets.ImageNet(data_path, split="train", transform=transform) # no augmentation
+        # Prefer the official ImageNet reader (it uses the WordNet metadata
+        # and lets us filter ImageNet-1k down to the selected subset).  If the
+        # data root is already a ready-made ImageFolder subset such as
+        # Imagenette/ImageWoof, fall back to ImageFolder.
+        train_dir = os.path.join(data_path, "train")
+        val_dir = os.path.join(data_path, "val")
+        try:
+            train_base = datasets.ImageNet(data_path, split="train", transform=transform)
+            test_base = datasets.ImageNet(data_path, split="val", transform=transform)
+            subset_folder = False
+        except Exception as exc:
+            if not (os.path.isdir(train_dir) and os.path.isdir(val_dir)):
+                raise
+            save_and_print(
+                args.log_path,
+                "ImageNet reader unavailable ({}); using ImageFolder at {}".format(
+                    type(exc).__name__, data_path
+                ),
+            )
+            train_base = datasets.ImageFolder(train_dir, transform=transform)
+            test_base = datasets.ImageFolder(val_dir, transform=transform)
+            subset_folder = True
 
         # A full ImageNet-1k root exposes 0..999 targets and is filtered with
         # the selected WordNet indices.  A ready-made 10-class subset folder
-        # (e.g. Imagenette) exposes 0..num_classes-1 targets, so use all of
-        # its classes instead of the original ImageNet indices.
-        if len(dst_train.classes) == num_classes:
+        # exposes 0..num_classes-1 targets, so use all of its classes.
+        if subset_folder or len(train_base.classes) == num_classes:
             selected_classes = list(range(num_classes))
             save_and_print(
                 args.log_path,
@@ -192,11 +218,29 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
         else:
             selected_classes = config.img_net_classes
 
-        dst_train_dict = {c : torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.equal(dst_train.targets, selected_classes[c])))) for c in range(len(selected_classes))}
-        dst_train = torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.isin(dst_train.targets, selected_classes))))
-        loader_train_dict = {c : torch.utils.data.DataLoader(dst_train_dict[c], batch_size=batch_size, shuffle=True, num_workers=16) for c in range(len(selected_classes))}
-        dst_test = datasets.ImageNet(data_path, split="val", transform=transform)
-        dst_test = torch.utils.data.Subset(dst_test, np.squeeze(np.argwhere(np.isin(dst_test.targets, selected_classes))))
+        train_targets = np.asarray(train_base.targets)
+        test_targets = np.asarray(test_base.targets)
+        dst_train_dict = {
+            c: torch.utils.data.Subset(
+                train_base,
+                np.squeeze(np.argwhere(np.equal(train_targets, selected_classes[c]))),
+            )
+            for c in range(len(selected_classes))
+        }
+        dst_train = torch.utils.data.Subset(
+            train_base,
+            np.squeeze(np.argwhere(np.isin(train_targets, selected_classes))),
+        )
+        loader_train_dict = {
+            c: torch.utils.data.DataLoader(
+                dst_train_dict[c], batch_size=batch_size, shuffle=True, num_workers=0
+            )
+            for c in range(len(selected_classes))
+        }
+        dst_test = torch.utils.data.Subset(
+            test_base,
+            np.squeeze(np.argwhere(np.isin(test_targets, selected_classes))),
+        )
 
         # ImageFolder stores targets in ``samples`` and its __getitem__ reads
         # from there, so mutating ``targets`` in place is not sufficient (and
@@ -204,10 +248,10 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
         # target_transform, which is also picklable for DataLoader workers.
         original_map = {x: i for i, x in enumerate(selected_classes)}
         target_transform = partial(_remap_target, mapping=original_map)
-        dst_train.dataset.target_transform = target_transform
-        dst_test.dataset.target_transform = target_transform
+        train_base.target_transform = target_transform
+        test_base.target_transform = target_transform
 
-        save_and_print(args.log_path, dst_test.dataset)
+        save_and_print(args.log_path, train_base)
         # __getitem__ now returns 0..num_classes-1, so downstream consumers
         # must not apply the original-label map a second time.  Keep
         # class_map_inv for callers that want the original ImageNet label.
@@ -229,6 +273,35 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
         dst_train = datasets.CIFAR100(data_path, train=True, download=True, transform=transform)  # no augmentation
         dst_test = datasets.CIFAR100(data_path, train=False, download=True, transform=transform)
         class_names = dst_train.classes
+        class_map = {x: x for x in range(num_classes)}
+
+    elif dataset == "Synthetic":
+        # Tiny deterministic dataset used by tests / smoke runs.  It never
+        # touches the network or the filesystem, so the full training loops
+        # can be exercised on a laptop.
+        channel = 3
+        im_size = (32, 32)
+        num_classes = 4
+        mean = [0.0, 0.0, 0.0]
+        std = [1.0, 1.0, 1.0]
+        gen = torch.Generator().manual_seed(1234)
+        centers = torch.randn(num_classes, channel, *im_size, generator=gen) * 0.7
+        train_imgs, train_labs = [], []
+        test_imgs, test_labs = [], []
+        for c in range(num_classes):
+            train_imgs.append(
+                centers[c].unsqueeze(0)
+                + 0.35 * torch.randn(40, channel, *im_size, generator=gen)
+            )
+            train_labs.append(torch.full((40,), c, dtype=torch.long))
+            test_imgs.append(
+                centers[c].unsqueeze(0)
+                + 0.35 * torch.randn(10, channel, *im_size, generator=gen)
+            )
+            test_labs.append(torch.full((10,), c, dtype=torch.long))
+        dst_train = TensorDataset(torch.cat(train_imgs, 0), torch.cat(train_labs))
+        dst_test = TensorDataset(torch.cat(test_imgs, 0), torch.cat(test_labs))
+        class_names = [str(c) for c in range(num_classes)]
         class_map = {x: x for x in range(num_classes)}
 
     elif dataset == "LSUN":

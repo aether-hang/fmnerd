@@ -1,308 +1,200 @@
-"""CPU smoke tests for the FM-NeRD implementation.
+"""CPU unit tests for the FM-NeRD core (run with ``python -m unittest``)."""
 
-Run from the ``fmnerd`` folder with the verified FreD environment:
+from __future__ import annotations
 
-    ../fred-python/.venv/bin/python -m unittest discover -s tests -v
-"""
-
-import math
 import os
 import sys
 import tempfile
 import unittest
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
 
-from fmnerd import FMNeRD, FiLMSirenRenderer, build_dct_matrix, dct_2d, idct_2d
-from fmnerd.frequency import (
-    build_frequency_scores,
-    collect_selected_coefficients,
-    collect_spectral_moments,
-    initialise_codes,
-    kmeans,
-    select_topk_indices,
-)
+from fmnerd import FMNeRD  # noqa: E402
+from fmnerd.dct import build_dct_matrix, dct_2d, idct_2d  # noqa: E402
+from fmnerd.frequency import build_class_evr_masks  # noqa: E402
+
+torch.set_num_threads(2)
+
+
+def make_dataset(num_classes=3, per_class=12, channel=3, size=16, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    centers = torch.randn(num_classes, channel, size, size, generator=gen) * 0.5
+    images, labels = [], []
+    for c in range(num_classes):
+        images.append(
+            centers[c].unsqueeze(0)
+            + 0.2 * torch.randn(per_class, channel, size, size, generator=gen)
+        )
+        labels.append(torch.full((per_class,), c, dtype=torch.long))
+    images = torch.cat(images, 0)
+    labels = torch.cat(labels, 0)
+    indices = [
+        list(range(c * per_class, (c + 1) * per_class)) for c in range(num_classes)
+    ]
+    return images, labels, indices
+
+
+def make_synset(tmpdir, **overrides):
+    cfg = dict(
+        channel=3,
+        num_classes=3,
+        im_size=(16, 16),
+        ipc=1,
+        device="cpu",
+        msz_per_channel=8,
+        layer_size=8,
+        num_shared_layers=2,
+        num_cond_layers=2,
+        w0_initial=30.0,
+        w0=10.0,
+        stage1_steps=8,
+        stage1_eval_every=4,
+        stage1_ckpt=os.path.join(tmpdir, "stage1.pt"),
+        lambda_freq_target=0.1,
+        freq_warmup=4,
+        decode_chunk=16,
+        logger=lambda msg: None,
+    )
+    cfg.update(overrides)
+    return FMNeRD(**cfg)
 
 
 class TestDCT(unittest.TestCase):
-    def test_matrix_matches_scipy(self):
-        from scipy.fftpack import dct
-
-        n = 8
-        mat = build_dct_matrix(n)
-        x = torch.randn(2, 3, n, n)
-        ours = dct_2d(x, mat, mat).numpy()
-        ref = dct(dct(x.numpy(), axis=-1, norm="ortho"), axis=-2, norm="ortho")
-        np.testing.assert_allclose(ours, ref, rtol=1e-5, atol=1e-5)
-
     def test_roundtrip(self):
-        n = 12
-        mat = build_dct_matrix(n)
-        x = torch.randn(4, 3, n, n)
-        np.testing.assert_allclose(idct_2d(dct_2d(x, mat, mat), mat, mat).numpy(), x.numpy(), atol=1e-5)
-
-    def test_orthonormal(self):
-        mat = build_dct_matrix(16)
-        eye = torch.eye(16)
-        np.testing.assert_allclose((mat @ mat.t()).numpy(), eye.numpy(), atol=1e-6)
+        x = torch.randn(2, 3, 16, 20)
+        mh = build_dct_matrix(16)
+        mw = build_dct_matrix(20)
+        y = idct_2d(dct_2d(x, mh, mw), mh, mw)
+        self.assertTrue(torch.allclose(x, y, atol=1e-5))
 
 
-class TestRenderer(unittest.TestCase):
-    def test_small_nonzero_residual_at_init(self):
-        torch.manual_seed(0)
-        renderer = FiLMSirenRenderer(3, code_dim=10, dim_hidden=8, dim_local=4, num_layers=4)
-        coords = torch.rand(5 * 5, 2) * 2 - 1
-        base = torch.randn(2, 3, 5, 5)
-        z = torch.randn(2, 10)
-        out = renderer(coords, base, z)
-        self.assertEqual(tuple(out.shape), (2, 25, 3))
-        self.assertTrue(torch.isfinite(out).all())
-        self.assertGreater(float(out.abs().max()), 0.0)
-        self.assertLessEqual(float(out.abs().max()), renderer.residual_alpha + 1e-6)
-
-    def test_siren_parameter_count(self):
-        renderer = FiLMSirenRenderer(
-            3, code_dim=20, dim_hidden=64, dim_local=32, num_layers=4
+class TestMask(unittest.TestCase):
+    def test_counts_and_indices(self):
+        images, labels, _ = make_dataset()
+        mh = build_dct_matrix(16)
+        mw = build_dct_matrix(16)
+        mask, indices, evr = build_class_evr_masks(
+            images, labels, 3, 8, mh, mw, chunk_size=5
         )
-        modulation = 20 * 32 + 32 + 2 * 32 + 32 * 128 + 128
-        first = 5 * 64 + 64
-        hidden = 2 * (64 * 64 + 64)
-        out = 64 * 3 + 3
-        self.assertEqual(renderer.num_parameters(), modulation + first + hidden + out)
-
-    def test_first_layer_is_sine(self):
-        torch.manual_seed(0)
-        renderer = FiLMSirenRenderer(
-            4, code_dim=12, dim_hidden=4, dim_local=2, num_layers=3
-        )
-        # Remove the hidden block and make the output an identity so that the
-        # renderer output exposes the first-layer activation directly.
-        renderer.hidden = torch.nn.ModuleList([])
-        renderer.out.weight.data = torch.eye(4)
-        renderer.out.bias.data.zero_()
-        coords = torch.randn(7, 2)
-        base = torch.zeros(1, 4, 7, 1)
-        z = torch.randn(1, 12)
-        out = renderer(coords, base, z)
-        anchor = base.permute(0, 2, 3, 1).reshape(1, 7, 4).detach()
-        u = torch.cat([coords.unsqueeze(0), anchor], dim=-1)
-        expected = renderer.residual_alpha * torch.tanh(
-            torch.sin(renderer.w0_first * renderer.first(u))
-        )
-        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
+        self.assertEqual(tuple(mask.shape), (3, 3, 16, 16))
+        self.assertEqual(tuple(indices.shape), (3, 24))
+        for c in range(3):
+            self.assertEqual(int(mask[c].sum().item()), 3 * 8)
+            self.assertEqual(len(set(indices[c].tolist())), 24)
+            # The same (h, w) pair is selected on every channel.
+            spatial = indices[c] % (16 * 16)
+            self.assertEqual(spatial[:8].tolist(), spatial[8:16].tolist())
+            self.assertEqual(spatial[:8].tolist(), spatial[16:].tolist())
+            self.assertEqual(len(set(spatial[:8].tolist())), 8)
+        self.assertTrue(torch.all(evr >= 0))
 
 
-class TestFrequency(unittest.TestCase):
-    def test_stats_and_mask(self):
-        torch.manual_seed(0)
-        n, c, h, w = 30, 3, 8, 8
-        labels = torch.arange(3).repeat_interleave(10)
-        images = torch.randn(n, c, h, w)
-        images[labels == 1] += 0.5
-        mat = build_dct_matrix(h)
-        moments = collect_spectral_moments(images, labels, 3, mat, mat, chunk_size=7)
-        scores = build_frequency_scores(moments, lambda_fisher=0.3, class_wise=False)
-        self.assertEqual(tuple(scores.shape), (c * h * w,))
-
-        idx = select_topk_indices(scores, 12, True, c, h, w)
-        self.assertEqual(tuple(idx.shape), (12,))
-        # 4 coefficients per channel.
-        channels = torch.div(idx, h * w, rounding_mode="floor")
-        self.assertEqual(sorted(channels.tolist()), [0] * 4 + [1] * 4 + [2] * 4)
-
-        idx_cw = select_topk_indices(
-            build_frequency_scores(moments, class_wise=True), 12, True, c, h, w
-        )
-        self.assertEqual(tuple(idx_cw.shape), (3, 12))
-
-        coeffs = collect_selected_coefficients(images, labels, idx, 3, mat, mat, chunk_size=9)
-        self.assertEqual([tuple(t.shape) for t in coeffs], [(10, 12)] * 3)
-
-    def test_per_channel_non_divisible_k(self):
-        torch.manual_seed(0)
-        scores = torch.randn(3 * 8 * 8)
-        idx = select_topk_indices(scores, 64, True, 3, 8, 8)
-        self.assertEqual(tuple(idx.shape), (64,))
-        counts = torch.bincount(
-            torch.div(idx, 8 * 8, rounding_mode="floor"), minlength=3
-        )
-        self.assertEqual(counts.tolist(), [22, 21, 21])
-
-    def test_kmeans(self):
-        torch.manual_seed(0)
-        centers = torch.tensor([[-3.0, 0.0], [0.0, 3.0], [3.0, 0.0]])
-        x = centers.repeat_interleave(20, 0) + 0.05 * torch.randn(60, 2)
-        found = kmeans(x, 3, seed=1)
-        distances = torch.cdist(centers, found).min(1).values
-        self.assertTrue(float(distances.max()) < 0.2)
-
-    def test_initialise_codes_from_real_rows(self):
-        torch.manual_seed(0)
-        coeffs = [
-            torch.arange(40, dtype=torch.float32).reshape(10, 4) + 100.0 * c
-            for c in range(3)
-        ]
-        init = initialise_codes(coeffs, 4, seed=7, mode="real")
-        init_again = initialise_codes(coeffs, 4, seed=7, mode="real")
-        self.assertTrue(torch.equal(init, init_again))
-        self.assertEqual(tuple(init.shape), (12, 4))
-        for c, coeff in enumerate(coeffs):
-            rows = {tuple(row.tolist()) for row in coeff}
-            for row in init[c * 4 : (c + 1) * 4]:
-                self.assertIn(tuple(row.tolist()), rows)
-
-
-def _dummy_dataset(num_classes=3, per_class=10, channel=3, size=8):
-    torch.manual_seed(1)
-    labels = torch.arange(num_classes).repeat_interleave(per_class)
-    images = torch.randn(num_classes * per_class, channel, size, size)
-    for c in range(num_classes):
-        images[labels == c] += 0.3 * c
-    return images, labels
-
-
-class TestFMNeRD(unittest.TestCase):
-    def _make(self, **kwargs):
-        logs = []
-        defaults = dict(
-            channel=3,
-            num_classes=3,
-            im_size=(8, 8),
-            ipc=1,
-            device="cpu",
-            freq_dim=12,
-            per_channel=True,
-            dipc=2,
-            dim_hidden=8,
-            dim_local=4,
-            num_layers=3,
-            warmup_steps=2,
-            lr_code=1e-2,
-            lr_siren=1e-3,
-            init_chunk=4,
-            decode_chunk=2,
-            logger=logs.append,
-        )
-        defaults.update(kwargs)
-        synset = FMNeRD(**defaults)
-        images, labels = _dummy_dataset()
-        synset.initialize_from_dataset(images, labels)
-        return synset, logs
-
+class TestSynSet(unittest.TestCase):
     def test_budget_and_decode(self):
-        synset, logs = self._make()
-        self.assertEqual(synset.num_total, 6)
-        self.assertEqual(synset.freq_dim, 12)
-        self.assertLessEqual(synset.param_renderer + synset.param_codes, synset.budget)
-        self.assertTrue(any("Budget" in line for line in logs))
-
-        images, labels = synset.get(need_copy=True)
-        self.assertEqual(tuple(images.shape), (6, 3, 8, 8))
-        self.assertEqual(tuple(labels.shape), (6,))
-        self.assertTrue(torch.isfinite(images).all())
-
-        # The revised architecture starts with a small, non-zero residual.
-        z = synset.z_low.detach()
-        flat = torch.zeros(6, 3 * 8 * 8)
-        fidx = synset.freq_indices.unsqueeze(0).expand(6, -1)
-        flat.scatter_(1, fidx, z)
-        base = idct_2d(flat.view(6, 3, 8, 8), synset.mat_h, synset.mat_w)
-        self.assertLessEqual(
-            float((images - base).abs().max()), synset.residual_alpha + 1e-6
-        )
-
-        small, _ = synset.get(need_copy=True, indices=[0, 3])
-        self.assertEqual(tuple(small.shape), (2, 3, 8, 8))
-
-    def test_regularisation_and_backward(self):
-        synset, _ = self._make()
-        _, _, aux = synset.get(return_aux=True)
-        prior, residual = synset.regularization(aux, aux["labels"])
-        self.assertGreaterEqual(float(prior), 0.0)
-        self.assertGreaterEqual(float(residual), 0.0)
-        self.assertGreater(float(residual), 0.0)
-
-        loss = prior + residual + aux["base"].pow(2).mean() + (aux["base"] + aux["delta"]).mean()
-        loss.backward()
-        self.assertIsNotNone(synset.z_low.grad)
-        self.assertGreater(float(synset.z_low.grad.abs().sum()), 0.0)
-        self.assertIsNotNone(synset.renderer.out.weight.grad)
-        self.assertGreater(float(synset.renderer.out.weight.grad.abs().sum()), 0.0)
-        # No zero-init deadlock: hidden SIREN and the global MLP also receive
-        # gradients on the first backward pass.
-        self.assertGreater(
-            float(synset.renderer.hidden[0].siren.linear.weight.grad.abs().sum()), 0.0
-        )
-        self.assertGreater(
-            float(synset.renderer.modulation.net[0].weight.grad.abs().sum()), 0.0
-        )
-
-        synset.optim_step()
-        synset.optim_zero_grad()
-        after, _ = synset.get(need_copy=True)
-        self.assertGreater(float((after - aux["base"].detach()).abs().max()), 0.0)
-
-    def test_warmup_switch(self):
-        synset, _ = self._make(warmup_steps=2)
-        self.assertTrue(synset.z_low.requires_grad)
-        synset.on_train_step(0)
-        self.assertFalse(synset.z_low.requires_grad)
-        synset.on_train_step(1)
-        self.assertFalse(synset.z_low.requires_grad)
-        synset.on_train_step(2)
-        self.assertTrue(synset.z_low.requires_grad)
-
-    def test_classwise_mask(self):
-        synset, _ = self._make(class_wise_mask=True)
-        self.assertEqual(tuple(synset.freq_indices.shape), (3, 12))
-        images, labels = synset.get(need_copy=True)
-        self.assertEqual(tuple(images.shape), (6, 3, 8, 8))
-        self.assertTrue(torch.isfinite(images).all())
-
-    def test_real_init_mode(self):
-        synset, logs = self._make(init_mode="real")
-        self.assertEqual(synset.init_mode, "real")
-        self.assertTrue(any("init=real" in line for line in logs))
-        images, _ = synset.get(need_copy=True)
-        self.assertEqual(tuple(images.shape), (6, 3, 8, 8))
-        self.assertTrue(torch.isfinite(images).all())
-
-    def test_chunked_decode_with_aux(self):
-        synset, _ = self._make(decode_chunk=2)
-        with torch.no_grad():
-            images, labels, aux = synset.get(need_copy=True, return_aux=True)
-        self.assertEqual(tuple(images.shape), (6, 3, 8, 8))
-        self.assertEqual(tuple(aux["z"].shape), (6, 12))
-        self.assertEqual(tuple(aux["labels"].shape), (6,))
-
-    def test_cross_resolution(self):
-        synset, _ = self._make()
-        images, _ = synset.get(need_copy=True, indices=[0])
-        self.assertEqual(tuple(images.shape), (1, 3, 8, 8))
-        # decode() supports a different output resolution
-        with torch.no_grad():
-            hi, _ = synset.decode(torch.tensor([0]), out_size=(12, 12))
-        self.assertEqual(tuple(hi.shape), (1, 3, 12, 12))
-        self.assertTrue(torch.isfinite(hi).all())
-
-    def test_save_load_roundtrip(self):
-        synset, _ = self._make()
-        before, _ = synset.get(need_copy=True)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "state.pt")
-            synset.save(path)
-            data = synset.load_state(path)
-        after, _ = synset.get(need_copy=True)
-        self.assertTrue(torch.allclose(before, after, atol=1e-7))
-        self.assertEqual(data["num_per_class"], 2)
+            images, labels, indices = make_dataset()
+            synset = make_synset(tmp)
+            synset.set_log_paths(os.path.join(tmp, "log.txt"), os.path.join(tmp, "m.jsonl"))
+            synset.initialize_from_dataset(images, labels, indices)
+            self.assertGreaterEqual(synset.num_per_class, 1)
+            self.assertEqual(synset.k, 24)
+            used = (
+                synset.p_siren_total + synset.p_modulation_total + synset.p_codes_total
+            )
+            self.assertLessEqual(used, synset.budget)
+            n = synset.num_per_class
+            ids = torch.tensor([0, 1, n, n + 1, 2 * n, 2 * n + 1])
+            out, lab = synset.get(indices=ids)
+            self.assertEqual(tuple(out.shape), (6, 3, 16, 16))
+            self.assertEqual(lab.tolist(), [0, 0, 1, 1, 2, 2])
 
-    def test_budget_overflow_detected(self):
-        with self.assertRaises(ValueError):
-            self._make(dipc=1000)
+    def test_modulation_zero_at_init_and_gradients(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(tmp, stage1_steps=0)
+            synset.initialize_from_dataset(images, labels, indices)
+            ids = torch.arange(min(9, synset.num_total))
+            mod, _ = synset.get(indices=ids, use_modulation=True)
+            shared, _ = synset.get(indices=ids, use_modulation=False)
+            # V is 1e-4 Gaussian, so the two decoders start almost identical.
+            self.assertLess(float((mod - shared).abs().max()), 1e-3)
+
+            aux, metrics = synset.auxiliary_losses(mod, ids, 0)
+            loss = mod.pow(2).mean() + aux
+            synset.optim_zero_grad()
+            loss.backward()
+            self.assertIsNotNone(synset.codes.grad)
+            self.assertGreater(float(synset.codes.grad.abs().sum()), 0.0)
+            mod_grads = [
+                p.grad for p in synset.renderer.modulation.parameters() if p.grad is not None
+            ]
+            self.assertTrue(mod_grads)
+            self.assertTrue(any(float(g.abs().sum()) > 0 for g in mod_grads))
+
+    def test_ablation_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(
+                tmp,
+                stage1_steps=0,
+                stage1_only=True,
+                use_freq_loss=False,
+                use_div_loss=False,
+            )
+            synset.initialize_from_dataset(images, labels, indices)
+            ids = torch.arange(4)
+            out, _ = synset.get(indices=ids)
+            aux, metrics = synset.auxiliary_losses(out, ids, 100)
+            self.assertEqual(float(aux), 0.0)
+            self.assertEqual(metrics["loss_freq"], 0.0)
+            self.assertFalse(synset.codes.requires_grad)
+            self.assertTrue(all(not p.requires_grad for p in synset.renderer.modulation.parameters()))
+
+    def test_vc_shared_smaller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            per_class = make_synset(tmp, stage1_steps=0)
+            per_class.initialize_from_dataset(images, labels, indices)
+            shared = make_synset(
+                tmp, stage1_steps=0, vc_shared=True,
+                stage1_ckpt=os.path.join(tmp, "stage1_shared.pt"),
+            )
+            shared.initialize_from_dataset(images, labels, indices)
+            self.assertLess(shared.p_modulation_total, per_class.p_modulation_total)
+            self.assertEqual(
+                shared.p_modulation_total,
+                sum(p.numel() for p in shared.renderer.modulation.parameters()),
+            )
+
+    def test_save_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(tmp, stage1_steps=0)
+            synset.initialize_from_dataset(images, labels, indices)
+            path = os.path.join(tmp, "ckpt.pt")
+            synset.save(path)
+            fresh = make_synset(tmp, stage1_steps=0,
+                                stage1_ckpt=os.path.join(tmp, "other.pt"))
+            fresh.initialize_from_dataset(images, labels, indices)
+            fresh.load(path)
+            a, _ = synset.get(indices=torch.arange(4), need_copy=True)
+            b, _ = fresh.get(indices=torch.arange(4), need_copy=True)
+            self.assertTrue(torch.allclose(a, b, atol=1e-6))
+
+
+class TestDiversity(unittest.TestCase):
+    def test_variance_floor_is_finite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(tmp, stage1_steps=0)
+            synset.initialize_from_dataset(images, labels, indices)
+            loss = synset.diversity_loss()
+            self.assertTrue(torch.isfinite(loss))
+            self.assertGreaterEqual(float(loss), 0.0)
 
 
 if __name__ == "__main__":

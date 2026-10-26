@@ -13,6 +13,7 @@ def main(args):
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     args.dsa_param = ParamDiffAug()
 
+    os.makedirs(args.buffer_path, exist_ok=True)
     save_dir = os.path.join(args.buffer_path, args.dataset)
     if args.dataset == "ImageNet":
         save_dir = os.path.join(save_dir, args.subset)
