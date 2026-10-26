@@ -136,8 +136,95 @@ class ShiftModulationBank(nn.Module):
         finally:
             self.train(was_training)
 
+    def vectors_for_class(self, class_id, codes):
+        """Return the ``V_c f_i`` vectors for one class."""
+        maps = self._maps_for_class(int(class_id))
+        return [lin(codes) for lin in maps]
+
     def parameter_count(self):
         return sum(p.numel() for p in self.parameters())
+
+
+class SpatialBasisBank(nn.Module):
+    """Per-class lightweight SIREN bases ``Phi_{c,l}: coords -> R^{d_l}``.
+
+    All conditioned layers of a class share one two-layer SIREN trunk; each
+    layer has its own linear head.  This keeps ``Phi`` about the same size as
+    (or smaller than) the shared backbone while allowing the modulation to
+    vary over the coordinate grid.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        coords_dim,
+        conditioned_indices,
+        layer_dims,
+        basis_width=8,
+        w0_initial=30.0,
+        w0=10.0,
+        init_mode="ddif",
+    ):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.coords_dim = int(coords_dim)
+        self.conditioned_indices = list(conditioned_indices)
+        self.layer_dims = [int(layer_dims[i]) for i in self.conditioned_indices]
+        self.basis_width = int(basis_width)
+
+        self.trunks = nn.ModuleList(
+            [self._make_trunk(w0_initial, w0, init_mode) for _ in range(self.num_classes)]
+        )
+        self.heads = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [nn.Linear(self.basis_width, d, bias=True) for d in self.layer_dims]
+                )
+                for _ in range(self.num_classes)
+            ]
+        )
+        with torch.no_grad():
+            for head_group in self.heads:
+                for head in head_group:
+                    bound = 1.0 / math.sqrt(max(1, self.basis_width))
+                    nn.init.uniform_(head.weight, -bound, bound)
+                    if head.bias is not None:
+                        nn.init.uniform_(head.bias, -bound, bound)
+
+    def _make_trunk(self, w0_initial, w0, init_mode):
+        return nn.Sequential(
+            SirenLayer(
+                self.coords_dim,
+                self.basis_width,
+                w0=w0_initial,
+                is_first=True,
+                is_output=False,
+                init_mode=init_mode,
+            ),
+            SirenLayer(
+                self.basis_width,
+                self.basis_width,
+                w0=w0,
+                is_first=False,
+                is_output=False,
+                init_mode=init_mode,
+            ),
+        )
+
+    def forward_class(self, class_id, coords):
+        """Return ``[P, d_l]`` spatial bases for every conditioned layer."""
+        h = self.trunks[int(class_id)](coords)
+        return [head(h) for head in self.heads[int(class_id)]]
+
+    def parameter_count(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def config(self):
+        return {
+            "basis_width": self.basis_width,
+            "conditioned_indices": list(self.conditioned_indices),
+            "layer_dims": list(self.layer_dims),
+        }
 
 
 class ClassSharedSiren(nn.Module):
@@ -212,7 +299,7 @@ class ClassSharedSiren(nn.Module):
             )
         return nn.Sequential(*layers)
 
-    def forward_class(self, class_id, coords, shifts=None):
+    def forward_class(self, class_id, coords, shifts=None, spatial=False):
         layers = self.backbones[int(class_id)]
         if shifts is None:
             h = coords
@@ -221,17 +308,18 @@ class ClassSharedSiren(nn.Module):
             return h
 
         # One coordinate matrix per instance: every instance has its own
-        # shift, so the batch dimension cannot be folded away.
+        # modulation, so the batch dimension cannot be folded away.
         batch = int(shifts[0].shape[0])
         h = coords.unsqueeze(0).expand(batch, -1, -1)
         for i, layer in enumerate(layers):
             shift = None
             if i in self.conditioned_indices:
-                shift = shifts[self.conditioned_indices.index(i)].unsqueeze(1)
+                current = shifts[self.conditioned_indices.index(i)]
+                shift = current if spatial else current.unsqueeze(1)
             h = layer(h, shift)
         return h
 
-    def forward(self, coords, labels, shifts=None):
+    def forward(self, coords, labels, shifts=None, spatial=False):
         """Decode all samples, grouping by class.
 
         Args:
@@ -251,7 +339,9 @@ class ClassSharedSiren(nn.Module):
                 class_shifts = None
             else:
                 class_shifts = [s[mask] for s in shifts]
-            out[mask] = self.forward_class(int(c), coords, class_shifts)
+            out[mask] = self.forward_class(
+                int(c), coords, class_shifts, spatial=spatial
+            )
         return out
 
     def num_parameters(self):

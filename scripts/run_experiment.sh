@@ -110,11 +110,12 @@ elif [ "$DATASET" = "ImageNet" ]; then
 else
   LR_SIREN=1e-4
 fi
+LR_SIREN_LATE_SCALE="${LR_SIREN_LATE_SCALE:-0.1}"
 LAMBDA_FREQ="${LAMBDA_FREQ:-0.1}"
 LAMBDA_DIV="${LAMBDA_DIV:-1e-3}"
 FREQ_WARMUP="${FREQ_WARMUP:-1000}"
 CODE_INIT_SCALE="${CODE_INIT_SCALE:-1.0}"
-MODULATION_CODE_SCALE="${MODULATION_CODE_SCALE:-0.1}"
+MODULATION_CODE_SCALE="${MODULATION_CODE_SCALE:-}"
 SIREN_INIT="${SIREN_INIT:-ddif}"
 CODE_MODE="${CODE_MODE:-residual}"
 CODE_STD_FLOOR="${CODE_STD_FLOOR:-1e-3}"
@@ -160,16 +161,22 @@ ARGS=(
   --num_shared_layers "$NUM_SHARED" --num_cond_layers "$NUM_COND"
   --stage1_steps "$STAGE1_STEPS" --stage1_lr "$STAGE1_LR"
   --lr_code "$LR_CODE" --lr_siren "$LR_SIREN"
+  --lr_siren_late_scale "$LR_SIREN_LATE_SCALE"
   --lambda_freq_target "$LAMBDA_FREQ" --freq_warmup "$FREQ_WARMUP"
   --lambda_div "$LAMBDA_DIV"
   --code_init_scale "$CODE_INIT_SCALE"
-  --modulation_code_scale "$MODULATION_CODE_SCALE"
   --siren_init "$SIREN_INIT"
   --code_mode "$CODE_MODE" --code_std_floor "$CODE_STD_FLOOR"
   --use_freq_loss "$USE_FREQ_LOSS" --use_div_loss "$USE_DIV_LOSS"
   --stage1_only "$STAGE1_ONLY" --vc_shared "$VC_SHARED"
 )
 
+if [ -n "$MODULATION_CODE_SCALE" ]; then
+  ARGS+=(--modulation_code_scale "$MODULATION_CODE_SCALE")
+fi
+if [ -n "${LAYER_SIZE:-}" ]; then
+  ARGS+=(--layer_size "$LAYER_SIZE")
+fi
 if [ -n "$FLAG" ]; then
   ARGS+=(--FLAG "$FLAG")
 fi

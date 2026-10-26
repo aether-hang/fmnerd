@@ -121,7 +121,7 @@ class TestSynSet(unittest.TestCase):
             mod, _ = synset.get(indices=ids, use_modulation=True)
             shared, _ = synset.get(indices=ids, use_modulation=False)
             # V is 1e-4 Gaussian, so the two decoders start almost identical.
-            self.assertLess(float((mod - shared).abs().max()), 1e-3)
+            self.assertLess(float((mod - shared).abs().max()), 5e-3)
 
             aux, metrics = synset.auxiliary_losses(mod, ids, 0)
             loss = mod.pow(2).mean() + aux

@@ -58,7 +58,7 @@ class FMNeRD(nn.Module):
         vc_shared=False,
         dipc=0,
         code_init_scale=1.0,
-        modulation_code_scale=0.1,
+        modulation_code_scale=None,
         code_mode="residual",
         code_std_floor=1e-3,
         stage1_steps=2000,
@@ -99,10 +99,12 @@ class FMNeRD(nn.Module):
         self.vc_shared = bool(vc_shared)
         self.dipc = int(dipc)
         self.code_init_scale = float(code_init_scale)
-        self.modulation_code_scale = float(modulation_code_scale)
         if code_mode not in ("residual", "absolute"):
             raise ValueError("code_mode must be 'residual' or 'absolute'")
         self.code_mode = str(code_mode)
+        if modulation_code_scale is None:
+            modulation_code_scale = 1.0 if self.code_mode == "residual" else 0.1
+        self.modulation_code_scale = float(modulation_code_scale)
         self.code_std_floor = float(code_std_floor)
         self.stage1_steps = int(stage1_steps)
         self.stage1_lr = float(stage1_lr)

@@ -47,8 +47,9 @@ z_i    = ( DCT(x_i)[M_c] - mu_c ) / max(s_c, code_std_floor)
 
 - `z_i` 的量级为 O(1)，不会被 DC/低频的巨大绝对值支配；
 - 共享骨干负责类均值，码只负责实例差异；
-- `--code_init_scale` 默认 `1.0`；`--modulation_code_scale 0.1` 只作用于
-  `phi_i=V_c z_i`，让 Stage 2 初始调制接近零。
+- `--code_init_scale` 默认 `1.0`；`--modulation_code_scale` 只作用于
+  `phi_i=V_c z_i`。residual 模式下默认 `1.0`（z 已是标准化残差），
+  absolute 模式下默认 `0.1`。V 仍以 `std=1e-4` 初始化，所以初始调制接近零。
 
 可用 `--code_mode absolute` 回到任务书原始的“绝对 top-k DCT 码”，但实测
 在 CIFAR-10 上会出现 `codes std≈8.6、absmax≈76、L_freq≈53` 的尺度爆炸，

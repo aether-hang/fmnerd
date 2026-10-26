@@ -102,8 +102,9 @@ def add_fmnerd_args(parser):
                    help="decoded images per class; 0 = fill remaining budget")
     g.add_argument("--code_init_scale", type=float, default=1.0,
                    help="scale applied to the stored top-k DCT target")
-    g.add_argument("--modulation_code_scale", type=float, default=0.1,
-                   help="separate scale of f when forming phi=V_c f")
+    g.add_argument("--modulation_code_scale", type=float, default=None,
+                   help="separate scale of f when forming phi=V_c f; "
+                        "default: 1.0 for residual, 0.1 for absolute")
     g.add_argument("--code_mode", type=str, default="residual",
                    choices=["residual", "absolute"],
                    help="residual = class-mean-subtracted standardized codes; "
