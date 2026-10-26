@@ -93,7 +93,7 @@ def add_fmnerd_args(parser):
                    help="SIREN width; default from DDiF hyper_params")
     g.add_argument("--w0_initial", type=float, default=None)
     g.add_argument("--w0", type=float, default=None)
-    g.add_argument("--siren_init", type=str, default="sqrt6",
+    g.add_argument("--siren_init", type=str, default="ddif",
                    choices=["sqrt6", "ddif"])
     g.add_argument("--vc_init_std", type=float, default=1e-4)
     g.add_argument("--vc_shared", type=str2bool, default=False,
@@ -104,6 +104,11 @@ def add_fmnerd_args(parser):
                    help="scale applied to the stored top-k DCT target")
     g.add_argument("--modulation_code_scale", type=float, default=0.1,
                    help="separate scale of f when forming phi=V_c f")
+    g.add_argument("--code_mode", type=str, default="residual",
+                   choices=["residual", "absolute"],
+                   help="residual = class-mean-subtracted standardized codes; "
+                        "absolute = raw top-k DCT codes")
+    g.add_argument("--code_std_floor", type=float, default=1e-3)
 
     g.add_argument("--stage1_steps", type=int, default=2000)
     g.add_argument("--stage1_lr", type=float, default=5e-4)

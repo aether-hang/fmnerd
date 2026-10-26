@@ -158,6 +158,35 @@ class TestSynSet(unittest.TestCase):
                 torch.allclose(scaled, full.codes.detach() * 0.1, atol=1e-7)
             )
 
+    def test_residual_codes_are_standardized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(tmp, stage1_steps=0, code_mode="residual")
+            synset.initialize_from_dataset(images, labels, indices)
+            codes = synset.codes.detach()
+            # Per-dimension standardization puts the init codes at O(1).
+            self.assertLess(float(codes.abs().max()), 10.0)
+            self.assertGreater(float(codes.std(unbiased=False)), 0.3)
+            self.assertEqual(tuple(synset.code_std.shape), (3, 24))
+            ids = torch.arange(6)
+            out, _ = synset.get(indices=ids)
+            aux, metrics = synset.auxiliary_losses(out, ids, 0)
+            self.assertTrue(torch.isfinite(aux))
+            self.assertLess(metrics["loss_freq"], 1e3)
+
+    def test_absolute_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            synset = make_synset(
+                tmp, stage1_steps=0, code_mode="absolute",
+                stage1_ckpt=os.path.join(tmp, "s1_abs.pt"),
+            )
+            synset.initialize_from_dataset(images, labels, indices)
+            ids = torch.arange(4)
+            out, _ = synset.get(indices=ids)
+            aux, _ = synset.auxiliary_losses(out, ids, 0)
+            self.assertTrue(torch.isfinite(aux))
+
     def test_ablation_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             images, labels, indices = make_dataset()

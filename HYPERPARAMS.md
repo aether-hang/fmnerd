@@ -31,6 +31,9 @@ lambda_freq       = 0.1    freq_warmup     = 1000
 lambda_div        = 1e-3   div_tau         = 1e-4
 vc_init_std       = 1e-4   code_init_scale = 1.0
 modulation_code_scale = 0.1
+siren_init        = ddif   (不要用 sqrt6，除非专门做低频谱消融)
+code_mode         = residual   (类均值残差 + 按类标准化)
+code_std_floor    = 1e-3
 ```
 
 蒸馏步数：

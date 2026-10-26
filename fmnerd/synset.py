@@ -34,7 +34,6 @@ from .frequency import (
     choose_real_init_indices,
     extract_selected,
     format_flat_index,
-    topk_amplitude_mse,
 )
 from .renderer import FMNeRDRenderer
 
@@ -54,12 +53,14 @@ class FMNeRD(nn.Module):
         num_cond_layers=2,
         w0_initial=30.0,
         w0=30.0,
-        siren_init="sqrt6",
+        siren_init="ddif",
         vc_init_std=1e-4,
         vc_shared=False,
         dipc=0,
         code_init_scale=1.0,
         modulation_code_scale=0.1,
+        code_mode="residual",
+        code_std_floor=1e-3,
         stage1_steps=2000,
         stage1_lr=5e-4,
         stage1_ckpt=None,
@@ -99,6 +100,10 @@ class FMNeRD(nn.Module):
         self.dipc = int(dipc)
         self.code_init_scale = float(code_init_scale)
         self.modulation_code_scale = float(modulation_code_scale)
+        if code_mode not in ("residual", "absolute"):
+            raise ValueError("code_mode must be 'residual' or 'absolute'")
+        self.code_mode = str(code_mode)
+        self.code_std_floor = float(code_std_floor)
         self.stage1_steps = int(stage1_steps)
         self.stage1_lr = float(stage1_lr)
         self.stage1_ckpt = stage1_ckpt
@@ -219,6 +224,8 @@ class FMNeRD(nn.Module):
         self.register_buffer("mask", torch.zeros(0))
         self.register_buffer("evr", torch.zeros(0))
         self.register_buffer("class_mean", torch.zeros(0))
+        self.register_buffer("code_mean", torch.zeros(0))
+        self.register_buffer("code_std", torch.ones(0))
         self.register_buffer("diag_refs", torch.zeros(0))
         self.register_buffer("diag_ref_labels", torch.zeros(0, dtype=torch.long))
         self.register_buffer(
@@ -374,34 +381,28 @@ class FMNeRD(nn.Module):
         self.mask = mask.to(self.device)
         self.freq_indices = freq_indices.to(self.device)
         self.evr = evr
+        hw = self.im_size[0] * self.im_size[1]
         for c in range(self.num_classes):
+            per_channel = self.freq_indices[c].cpu()[: self.msz_per_channel] % hw
+            u = torch.div(
+                per_channel, self.im_size[1], rounding_mode="floor"
+            )
+            v = per_channel % self.im_size[1]
+            radius = u + v
+            high = int((radius >= self.im_size[0] // 2).sum().item())
             self._log(
-                "  class {:3d} | {} spatial frequencies x {} channels = {} coefficients".format(
-                    c, self.msz_per_channel, self.channel, self.k
+                "  class {:3d} | {} spatial frequencies x {} channels = {} coefficients | "
+                "mean u+v={:.1f} | high-freq (u+v>={})={}/{}".format(
+                    c,
+                    self.msz_per_channel,
+                    self.channel,
+                    self.k,
+                    float(radius.float().mean()),
+                    self.im_size[0] // 2,
+                    high,
+                    self.msz_per_channel,
                 )
             )
-
-        # Real-image initialisation, as in FreD.
-        init_indices = choose_real_init_indices(
-            indices_class,
-            self.num_per_class,
-            seed=self.seed,
-            num_classes=self.num_classes,
-        )
-        init_images = images[init_indices].to(self.device)
-        with torch.no_grad():
-            freq = dct_2d(init_images, self.mat_h, self.mat_w)
-            init_codes = extract_selected(
-                freq, self.freq_indices, self.label_syn.to(self.device)
-            ).detach().cpu()
-        del init_images, freq
-        self.codes = nn.Parameter(
-            (init_codes * self.code_init_scale).to(self.device),
-            requires_grad=not self.stage1_only,
-        )
-        if self.stage1_only:
-            for param in self.renderer.modulation.parameters():
-                param.requires_grad_(False)
 
         # Spatial class mean is the Stage-1 target.  It is exactly the same
         # target as IDCT(mean top-k code) up to the discarded frequencies.
@@ -415,6 +416,69 @@ class FMNeRD(nn.Module):
         for c in range(self.num_classes):
             mean[c] = images[indices_class[c]].mean(dim=0)
         self.class_mean = mean.to(self.device)
+
+        # Real-image initialisation, as in FreD.
+        init_indices = choose_real_init_indices(
+            indices_class,
+            self.num_per_class,
+            seed=self.seed,
+            num_classes=self.num_classes,
+        )
+        init_images = images[init_indices].to(self.device)
+        with torch.no_grad():
+            freq = dct_2d(init_images, self.mat_h, self.mat_w)
+            raw_codes = extract_selected(
+                freq, self.freq_indices, self.label_syn.to(self.device)
+            ).detach().cpu()
+        del init_images, freq
+
+        if self.code_mode == "residual":
+            # The shared backbone already owns the class mean.  Codes encode
+            # only the instance residual around that mean, standardized per
+            # frequency dimension so that DC/low-frequency coefficients do
+            # not dominate the MSE.
+            with torch.no_grad():
+                mean_freq = dct_2d(self.class_mean, self.mat_h, self.mat_w)
+                code_mean = extract_selected(
+                    mean_freq,
+                    self.freq_indices,
+                    torch.arange(self.num_classes, device=self.device),
+                ).detach().cpu()
+            code_std = torch.ones_like(code_mean)
+            n = self.num_per_class
+            valid = []
+            for c in range(self.num_classes):
+                chunk = raw_codes[c * n : (c + 1) * n] - code_mean[c]
+                if chunk.shape[0] > 1:
+                    code_std[c] = chunk.std(dim=0, unbiased=False)
+                    valid.append(c)
+            if valid:
+                global_std = code_std[valid].mean(dim=0)
+            else:
+                global_std = code_std.mean(dim=0)
+            for c in range(self.num_classes):
+                if c not in valid:
+                    code_std[c] = global_std
+            code_std = code_std.clamp_min(self.code_std_floor)
+            labels_cpu = self.label_syn.cpu()
+            codes = (raw_codes - code_mean[labels_cpu]) / code_std[labels_cpu]
+            codes = codes * self.code_init_scale
+        elif self.code_mode == "absolute":
+            code_mean = torch.zeros_like(raw_codes)
+            code_std = torch.ones_like(raw_codes)
+            codes = raw_codes * self.code_init_scale
+        else:
+            raise ValueError("unknown code_mode: {}".format(self.code_mode))
+
+        self.code_mean = code_mean.to(self.device)
+        self.code_std = code_std.to(self.device)
+        self.codes = nn.Parameter(
+            codes.to(self.device),
+            requires_grad=not self.stage1_only,
+        )
+        if self.stage1_only:
+            for param in self.renderer.modulation.parameters():
+                param.requires_grad_(False)
 
         # Four real references per class for the shared-vs-modulated
         # diagnostic.  They are the images that initialised the first four
@@ -669,6 +733,29 @@ class FMNeRD(nn.Module):
         code_tensor = self.codes if codes is None else codes
         return code_tensor * self.modulation_code_scale
 
+    def predicted_frequency_codes(self, images, labels):
+        """Selected DCT of decoded images in the code's own space.
+
+        For ``code_mode='residual'`` this subtracts the class mean and divides
+        by the per-class/per-frequency standard deviation, exactly matching
+        the standardized residual codes.
+        """
+        freq = dct_2d(images, self.mat_h, self.mat_w)
+        pred = extract_selected(freq, self.freq_indices, labels)
+        if self.code_mode == "residual":
+            pred = (pred - self.code_mean[labels]) / self.code_std[labels]
+        return pred
+
+    def frequency_alignment(self, images, indices):
+        labels = self.label_syn[indices]
+        pred = self.predicted_frequency_codes(images, labels)
+        target = self.codes[indices].detach()
+        if self.code_mode == "absolute":
+            residual = (pred.abs() - target.abs()).pow(2)
+        else:
+            residual = (pred - target).pow(2)
+        return residual
+
     def decode(self, indices, use_modulation=True):
         indices = self._normalise_indices(indices)
         labels = self.label_syn[indices]
@@ -739,12 +826,7 @@ class FMNeRD(nn.Module):
         return total / max(1, count)
 
     def frequency_loss(self, images, indices):
-        labels = self.label_syn[indices]
-        freq = dct_2d(images, self.mat_h, self.mat_w)
-        _, loss = topk_amplitude_mse(
-            freq, self.codes[indices], self.freq_indices, labels
-        )
-        return loss
+        return self.frequency_alignment(images, indices).mean()
 
     def auxiliary_losses(self, images, indices, step):
         indices = self._normalise_indices(indices)
@@ -868,10 +950,7 @@ class FMNeRD(nn.Module):
                 indices.append(c * self.num_per_class + j)
         indices = torch.as_tensor(indices, device=self.device)
         images, labels = self.get(indices, need_copy=True)
-        freq = dct_2d(images, self.mat_h, self.mat_w)
-        pred = extract_selected(freq, self.freq_indices, labels).abs()
-        target = self.codes[indices].detach().abs()
-        residual = (pred - target).pow(2)
+        residual = self.frequency_alignment(images, indices)
         self._log(
             "[diag {}] top-k frequency alignment residual ({} samples/class)".format(
                 step, per_class
@@ -927,8 +1006,6 @@ class FMNeRD(nn.Module):
             for j in range(per_class):
                 indices.append(c * self.num_per_class + j)
         indices = torch.as_tensor(indices, device=self.device)
-        labels = self.label_syn[indices]
-        target_codes = self.codes[indices].detach()
 
         refs = self.diag_refs.view(
             self.num_classes, self.refs_per_class, self.channel, *self.im_size
@@ -936,10 +1013,7 @@ class FMNeRD(nn.Module):
 
         def evaluate(use_modulation):
             images, _ = self.get(indices, need_copy=True, use_modulation=use_modulation)
-            freq = dct_2d(images, self.mat_h, self.mat_w)
-            _, freq_loss = topk_amplitude_mse(
-                freq, target_codes, self.freq_indices, labels
-            )
+            freq_loss = self.frequency_alignment(images, indices).mean()
             pixel_mse = (images - refs).pow(2).mean(dim=(1, 2, 3))
             return (
                 float(freq_loss.item()),
@@ -1051,6 +1125,8 @@ class FMNeRD(nn.Module):
             "mask": self.mask.detach().cpu(),
             "label_syn": self.label_syn.detach().cpu(),
             "class_mean": self.class_mean.detach().cpu(),
+            "code_mean": self.code_mean.detach().cpu(),
+            "code_std": self.code_std.detach().cpu(),
             "diag_refs": self.diag_refs.detach().cpu(),
             "diag_ref_labels": self.diag_ref_labels.detach().cpu(),
             "refs_per_class": int(self.refs_per_class),
@@ -1071,6 +1147,8 @@ class FMNeRD(nn.Module):
                 "vc_shared": self.vc_shared,
                 "code_init_scale": self.code_init_scale,
                 "modulation_code_scale": self.modulation_code_scale,
+                "code_mode": self.code_mode,
+                "code_std_floor": self.code_std_floor,
                 "renderer": self.renderer.config(),
             },
         }
@@ -1089,6 +1167,10 @@ class FMNeRD(nn.Module):
         self.mask = data["mask"].to(self.device)
         self.label_syn = data["label_syn"].to(self.device)
         self.class_mean = data["class_mean"].to(self.device)
+        if "code_mean" in data:
+            self.code_mean = data["code_mean"].to(self.device)
+        if "code_std" in data:
+            self.code_std = data["code_std"].to(self.device)
         self.diag_refs = data.get("diag_refs", torch.zeros(0)).to(self.device)
         self.diag_ref_labels = data.get(
             "diag_ref_labels", torch.zeros(0, dtype=torch.long)
@@ -1103,6 +1185,10 @@ class FMNeRD(nn.Module):
             self.code_init_scale = float(cfg["code_init_scale"])
         if "modulation_code_scale" in cfg:
             self.modulation_code_scale = float(cfg["modulation_code_scale"])
+        if "code_mode" in cfg:
+            self.code_mode = str(cfg["code_mode"])
+        if "code_std_floor" in cfg:
+            self.code_std_floor = float(cfg["code_std_floor"])
         self._setup_stage2()
         self.initialized = True
         return data

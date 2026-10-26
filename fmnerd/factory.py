@@ -33,6 +33,8 @@ def build_synset(
         dipc=args.dipc,
         code_init_scale=args.code_init_scale,
         modulation_code_scale=args.modulation_code_scale,
+        code_mode=args.code_mode,
+        code_std_floor=args.code_std_floor,
         stage1_steps=args.stage1_steps,
         stage1_lr=args.stage1_lr,
         stage1_ckpt=args.stage1_ckpt,

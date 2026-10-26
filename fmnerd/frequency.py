@@ -187,21 +187,42 @@ def compute_masks_and_codes(
     return mask, indices, evr.cpu(), init_indices, init_images, init_codes
 
 
-def topk_amplitude_mse(pred_dct, target_codes, freq_indices, labels):
-    """Per-sample top-k amplitude MSE and the signed residual.
+def topk_amplitude_mse(
+    pred_dct,
+    target_codes,
+    freq_indices,
+    labels,
+    code_mean=None,
+    code_std=None,
+    use_abs=True,
+):
+    """Top-k frequency alignment residual.
 
     Args:
         pred_dct: ``[B, C, H, W]`` DCT of decoded images.
-        target_codes: ``[B, k]`` learnable / reference frequency codes.
+        target_codes: ``[B, k]`` learnable / reference codes.
         freq_indices: ``[Cnum, k]`` flat indices.
         labels: ``[B]``.
+        code_mean / code_std: optional ``[Cnum, k]`` standardization
+            statistics.  When supplied, the decoded DCT is compared in the
+            same standardized "class-residual" space as the codes.
+        use_abs: align amplitude (``|DCT|`` vs ``|f|``) instead of the signed
+            coefficient.  Absolute DCT alignment is the task's original
+            definition; signed residual alignment is used for the more stable
+            class-residual representation.
 
     Returns:
-        residual: ``[B, k]`` squared amplitude error.
+        residual: ``[B, k]`` squared error.
         mse: scalar mean over all entries.
     """
     pred = extract_selected(pred_dct, freq_indices, labels)
-    residual = (pred.abs() - target_codes.detach().abs()).pow(2)
+    if code_mean is not None and code_std is not None:
+        pred = (pred - code_mean[labels]) / code_std[labels]
+    target = target_codes.detach()
+    if use_abs:
+        residual = (pred.abs() - target.abs()).pow(2)
+    else:
+        residual = (pred - target).pow(2)
     return residual, residual.mean()
 
 

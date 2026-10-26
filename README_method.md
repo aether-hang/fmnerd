@@ -32,18 +32,30 @@ M_c        = top-k(EVR_c),  msz_per_channel 个 (h,w)
   `M_c` 的索引集合 `\mathcal{M}_c`（长度 `k`）；
 - 实现位置：`fmnerd/frequency.py::build_class_evr_masks`。
 
-### 1.2 每实例频率码（FreD）
+### 1.2 每实例频率码（FreD，类残差标准化）
 
-从真实训练集中为每个类抽取 `num_per_class` 张图片，计算
-`f_i = DCT(x_i)[\mathcal{M}_c]`，存成可学习向量 `f_i ∈ R^k`。
-`f_i` 的初值保留**真实 top-k DCT 幅值**（`--code_init_scale 1.0`），
-这样 `L_freq` 对齐的是正确的绝对频率尺度；若需要让 Stage 2 初期的调制
-更小，使用独立的 `--modulation_code_scale 0.1`，它只作用于
-`phi_i=V_c f_i`，不会改变频率对齐目标。实现位置：
-`fmnerd/synset.py::initialize_from_dataset` 与 `modulation_codes()`。
+共享骨干 `F_{\psi_c}` 已经负责类均值，因此每实例码不应该再重复编码
+绝对 DCT（尤其是很大的 DC/低频幅值）。默认 `--code_mode residual`：
 
-> 早期版本把 0.1 同时乘在 `f_i` 和 `L_freq` 目标上，等于要求解码图像的
-> 低频幅度只有真实值的 10%，会严重破坏图像均值/颜色并拖低准确率。
+```text
+mu_c   = DCT( mean_{i in class c} x_i )[M_c]
+s_c    = std_{i in class c}( DCT(x_i)[M_c] - mu_c )
+z_i    = ( DCT(x_i)[M_c] - mu_c ) / max(s_c, code_std_floor)
+```
+
+`z_i ∈ R^k` 是可学习向量，初值来自真实图片的标准化残差。这样：
+
+- `z_i` 的量级为 O(1)，不会被 DC/低频的巨大绝对值支配；
+- 共享骨干负责类均值，码只负责实例差异；
+- `--code_init_scale` 默认 `1.0`；`--modulation_code_scale 0.1` 只作用于
+  `phi_i=V_c z_i`，让 Stage 2 初始调制接近零。
+
+可用 `--code_mode absolute` 回到任务书原始的“绝对 top-k DCT 码”，但实测
+在 CIFAR-10 上会出现 `codes std≈8.6、absmax≈76、L_freq≈53` 的尺度爆炸，
+不推荐正式实验使用。
+
+实现位置：`fmnerd/synset.py::initialize_from_dataset`、`predicted_frequency_codes()`
+和 `modulation_codes()`。
 
 ### 1.3 类共享 SIREN 骨干（DDiF）
 
@@ -58,9 +70,11 @@ M_c        = top-k(EVR_c),  msz_per_channel 个 (h,w)
 - `w0_initial`、`w0` 默认从 DDiF `hyper_params.py` 的 ImageNet-128
   IPC=1 配置取（30 / 40）；CIFAR 使用 30 / 10 与 DDiF 的宽度配置；
 - `w0` 是常量，不是可学习参数；
-- 第一层初始化默认按任务给出的
-  `sqrt(6/fan_in)/w0_initial`；`--siren_init ddif` 可切换为 DDiF 原始的
-  `1/fan_in` 第一层初始化。
+- 第一层初始化默认使用 **DDiF/原版 SIREN 的 `U(-1/fan_in, 1/fan_in)`**
+  （`--siren_init ddif`）。任务书中的 `sqrt(6/fan_in)/w0_initial` 公式仍然
+  保留为 `--siren_init sqrt6`，但它会把第一层幅度压低约 8-10 倍，导致
+  SIREN 的频谱能力严重偏低，Stage 2 很难生成高频细节，表现为合成图像
+  “模糊、笼统”。做对照实验时请把 `sqrt6` 只当作消融项。
 
 ### 1.4 每类调制映射 `V_c` 与 shift
 
@@ -78,13 +92,17 @@ h^(l+1)  = sin( w0 * ( W^(l) h^(l) + b^(l) + phi_i^(l) ) )
 
 ### 1.5 输出端 top-k DCT 频率对齐损失
 
-对解码图像 `\tilde{x}_i` 做正交 2D DCT，仅取类 mask 的 `k` 个索引：
+对解码图像 `\tilde{x}_i` 做正交 2D DCT，仅取类 mask 的 `k` 个索引，并在
+与码相同的标准化残差空间中比较：
 
 ```text
-L_freq = 1/(N k) Σ_i Σ_{(u,v)∈M_c} ( |DCT(\tilde{x}_i)|_{u,v} - |f_i|_{u,v} )^2
+pred_i = ( DCT(x_hat_i)[M_c] - mu_c ) / max(s_c, code_std_floor)
+L_freq = 1/(N k) Σ_i Σ_{j=1..k} ( pred_i[j] - z_i[j] )^2
 ```
 
-- 对齐目标是 `f_i.detach()`，让图像去追频率码，而不是让频率码塌缩到图像；
+- `code_mode=residual` 使用 signed residual（保留符号）；
+- `code_mode=absolute` 仍按任务书使用 `|DCT|` 与 `|f|`；
+- 对齐目标是 `z_i.detach()`，避免频率码通过 L_freq 自我塌缩；
 - `lambda_freq(t)` 从 `0.01` 线性 warm-up 到 `0.1`，默认 `1000` 步；
 - `--use_freq_loss False` 时 `lambda_freq = 0`。
 
@@ -219,7 +237,7 @@ used    = num_classes * P_SIREN
 | `--vc_shared {True,False}` | `False` | 所有类共享一个 `V` |
 | `--msz_per_channel` / `--k` | `64` / `None` | 控制每实例频率码维度；`k` 必须是通道数整数倍 |
 | `--num_shared_layers` / `--num_cond_layers` | `2` / `2` | SIREN 分割点（总层数含输出层） |
-| `--siren_init {sqrt6,ddif}` | `sqrt6` | 第一层初始化公式 |
+| `--siren_init {sqrt6,ddif}` | `ddif` | 第一层初始化公式；`sqrt6` 仅作低频谱消融 |
 | `--dipc` | `0` | 显式指定每类解码图片数 |
 
 辅助超参：`--lambda_freq_start/target`、`--freq_warmup`、

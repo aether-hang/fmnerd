@@ -115,6 +115,9 @@ LAMBDA_DIV="${LAMBDA_DIV:-1e-3}"
 FREQ_WARMUP="${FREQ_WARMUP:-1000}"
 CODE_INIT_SCALE="${CODE_INIT_SCALE:-1.0}"
 MODULATION_CODE_SCALE="${MODULATION_CODE_SCALE:-0.1}"
+SIREN_INIT="${SIREN_INIT:-ddif}"
+CODE_MODE="${CODE_MODE:-residual}"
+CODE_STD_FLOOR="${CODE_STD_FLOOR:-1e-3}"
 
 # Ablation switches; 1/true keeps the module, 0/false disables it.
 to_bool() {
@@ -161,6 +164,8 @@ ARGS=(
   --lambda_div "$LAMBDA_DIV"
   --code_init_scale "$CODE_INIT_SCALE"
   --modulation_code_scale "$MODULATION_CODE_SCALE"
+  --siren_init "$SIREN_INIT"
+  --code_mode "$CODE_MODE" --code_std_floor "$CODE_STD_FLOOR"
   --use_freq_loss "$USE_FREQ_LOSS" --use_div_loss "$USE_DIV_LOSS"
   --stage1_only "$STAGE1_ONLY" --vc_shared "$VC_SHARED"
 )
