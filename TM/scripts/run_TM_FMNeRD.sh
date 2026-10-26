@@ -12,7 +12,7 @@ data_path="../data"
 buffer_path="../buffers"
 save_path="../logs"
 
-msz_per_channel=64
+msz_per_channel=16
 batch_syn=0          # 0 = decode the full per-class budget
 Iteration=15000
 eval_it=500

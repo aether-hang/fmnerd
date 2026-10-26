@@ -8,7 +8,7 @@ sh_file="run_DC_FMNeRD.sh"
 data_path="../data"
 save_path="../logs"
 
-msz_per_channel=64
+msz_per_channel=16
 batch_syn=0
 Iteration=1000
 eval_it=500

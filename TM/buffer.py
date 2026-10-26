@@ -13,6 +13,16 @@ def main(args):
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     args.dsa_param = ParamDiffAug()
 
+    # Keep the buffer directory name consistent with TM/DM/DC, which normalise
+    # FreD's short subset names (nette/woof) to torchvision folder names.
+    if args.dataset == "ImageNet":
+        aliases = {
+            "nette": "imagenette", "woof": "imagewoof",
+            "fruits": "imagefruit", "yellow": "imageyellow",
+            "cats": "imagemeow", "birds": "imagesquawk",
+        }
+        args.subset = aliases.get(args.subset, args.subset)
+
     os.makedirs(args.buffer_path, exist_ok=True)
     save_dir = os.path.join(args.buffer_path, args.dataset)
     if args.dataset == "ImageNet":

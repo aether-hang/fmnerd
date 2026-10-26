@@ -58,7 +58,8 @@ class FMNeRD(nn.Module):
         vc_init_std=1e-4,
         vc_shared=False,
         dipc=0,
-        code_init_scale=0.1,
+        code_init_scale=1.0,
+        modulation_code_scale=0.1,
         stage1_steps=2000,
         stage1_lr=5e-4,
         stage1_ckpt=None,
@@ -97,6 +98,7 @@ class FMNeRD(nn.Module):
         self.vc_shared = bool(vc_shared)
         self.dipc = int(dipc)
         self.code_init_scale = float(code_init_scale)
+        self.modulation_code_scale = float(modulation_code_scale)
         self.stage1_steps = int(stage1_steps)
         self.stage1_lr = float(stage1_lr)
         self.stage1_ckpt = stage1_ckpt
@@ -595,6 +597,7 @@ class FMNeRD(nn.Module):
                     "channel": self.channel,
                     "im_size": list(self.im_size),
                     "num_classes": self.num_classes,
+                    "siren_init": self.siren_init,
                     "siren": {k: v.detach().cpu() for k, v in self.renderer.siren.state_dict().items()},
                     "stage1_steps": self.stage1_steps,
                     "stage1_lr": self.stage1_lr,
@@ -654,10 +657,26 @@ class FMNeRD(nn.Module):
             indices = torch.as_tensor(list(indices), dtype=torch.long)
         return indices.to(self.device, dtype=torch.long)
 
+    def modulation_codes(self, codes=None):
+        """Codes fed to ``V_c``; kept separate from the L_freq target.
+
+        ``f_i`` itself stores the real top-k DCT amplitude so that L_freq
+        aligns the decoder with the correct absolute frequency scale.  The
+        optional ``modulation_code_scale`` only makes the initial modulation
+        small (V is also initialised near zero), exactly as the task's 0.1
+        factor intended.
+        """
+        code_tensor = self.codes if codes is None else codes
+        return code_tensor * self.modulation_code_scale
+
     def decode(self, indices, use_modulation=True):
         indices = self._normalise_indices(indices)
         labels = self.label_syn[indices]
-        codes = self.codes[indices] if (use_modulation and not self.stage1_only) else None
+        codes = (
+            self.modulation_codes(self.codes[indices])
+            if (use_modulation and not self.stage1_only)
+            else None
+        )
         out = self.renderer(
             self.coords.to(self.device),
             labels,
@@ -707,7 +726,9 @@ class FMNeRD(nn.Module):
     def diversity_loss(self):
         if self.stage1_only or not self.use_div_loss or self.num_per_class < 2:
             return self.codes.new_zeros(())
-        shifts = self.renderer.modulation(self.codes, self.label_syn.to(self.device))
+        shifts = self.renderer.modulation(
+            self.modulation_codes(), self.label_syn.to(self.device)
+        )
         total = self.codes.new_zeros(())
         count = 0
         for phi in shifts:
@@ -794,7 +815,21 @@ class FMNeRD(nn.Module):
     @torch.no_grad()
     def log_modulation(self, step):
         shifts = self.renderer.modulation.all_shifts(
-            self.codes.detach(), self.label_syn.to(self.device)
+            self.modulation_codes(self.codes.detach()),
+            self.label_syn.to(self.device),
+        )
+        self._log("[diag {}] frequency code statistics".format(step))
+        codes = self.codes.detach()
+        self._log(
+            "  codes: mean={:.4e} std={:.4e} absmax={:.4e} | "
+            "modulation_code_scale={:.3f} (phi sees mean={:.4e} std={:.4e})".format(
+                float(codes.mean()),
+                float(codes.std(unbiased=False)),
+                float(codes.abs().max()),
+                self.modulation_code_scale,
+                float((codes * self.modulation_code_scale).mean()),
+                float((codes * self.modulation_code_scale).std(unbiased=False)),
+            )
         )
         self._log("[diag {}] modulation magnitude per layer".format(step))
         for layer_idx, phi in enumerate(shifts):
@@ -906,10 +941,15 @@ class FMNeRD(nn.Module):
                 freq, target_codes, self.freq_indices, labels
             )
             pixel_mse = (images - refs).pow(2).mean(dim=(1, 2, 3))
-            return float(freq_loss.item()), pixel_mse
+            return (
+                float(freq_loss.item()),
+                pixel_mse,
+                float(images.mean()),
+                float(images.std(unbiased=False)),
+            )
 
-        freq_mod, pix_mod = evaluate(True)
-        freq_shared, pix_shared = evaluate(False)
+        freq_mod, pix_mod, mean_mod, std_mod = evaluate(True)
+        freq_shared, pix_shared, mean_shared, std_shared = evaluate(False)
         self._log(
             "[diag {}] shared backbone vs instance modulation "
             "(top-k freq alignment / pixel MSE to init real images; {}/class)".format(
@@ -917,13 +957,15 @@ class FMNeRD(nn.Module):
             )
         )
         self._log(
-            "  shared (no modulation): freq {:.6e} | pixel {:.6e}".format(
-                freq_shared, float(pix_shared.mean())
+            "  shared (no modulation): freq {:.6e} | pixel {:.6e} | "
+            "image mean/std {:.3f}/{:.3f}".format(
+                freq_shared, float(pix_shared.mean()), mean_shared, std_shared
             )
         )
         self._log(
-            "  with modulation       : freq {:.6e} | pixel {:.6e}".format(
-                freq_mod, float(pix_mod.mean())
+            "  with modulation       : freq {:.6e} | pixel {:.6e} | "
+            "image mean/std {:.3f}/{:.3f}".format(
+                freq_mod, float(pix_mod.mean()), mean_mod, std_mod
             )
         )
         if freq_shared > 0:
@@ -940,6 +982,8 @@ class FMNeRD(nn.Module):
                 "freq_modulated": freq_mod,
                 "pixel_shared": float(pix_shared.mean()),
                 "pixel_modulated": float(pix_mod.mean()),
+                "image_std_shared": std_shared,
+                "image_std_modulated": std_mod,
             },
         )
 
@@ -1025,6 +1069,8 @@ class FMNeRD(nn.Module):
                 "w0": self.w0,
                 "siren_init": self.siren_init,
                 "vc_shared": self.vc_shared,
+                "code_init_scale": self.code_init_scale,
+                "modulation_code_scale": self.modulation_code_scale,
                 "renderer": self.renderer.config(),
             },
         }
@@ -1053,6 +1099,10 @@ class FMNeRD(nn.Module):
             self.num_per_class = int(cfg["num_per_class"])
             self.num_total = self.num_classes * self.num_per_class
             self.p_codes_total = self.num_total * self.k
+        if "code_init_scale" in cfg:
+            self.code_init_scale = float(cfg["code_init_scale"])
+        if "modulation_code_scale" in cfg:
+            self.modulation_code_scale = float(cfg["modulation_code_scale"])
         self._setup_stage2()
         self.initialized = True
         return data

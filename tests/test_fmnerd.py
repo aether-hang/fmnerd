@@ -135,6 +135,29 @@ class TestSynSet(unittest.TestCase):
             self.assertTrue(mod_grads)
             self.assertTrue(any(float(g.abs().sum()) > 0 for g in mod_grads))
 
+    def test_code_target_and_modulation_scale_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            full = make_synset(
+                tmp, stage1_steps=0, code_init_scale=1.0,
+                modulation_code_scale=0.1,
+            )
+            full.initialize_from_dataset(images, labels, indices)
+            small = make_synset(
+                tmp, stage1_steps=0, code_init_scale=0.1,
+                modulation_code_scale=0.1,
+                stage1_ckpt=os.path.join(tmp, "stage1_small.pt"),
+            )
+            small.initialize_from_dataset(images, labels, indices)
+            self.assertGreater(
+                float(full.codes.detach().abs().mean()),
+                5.0 * float(small.codes.detach().abs().mean()),
+            )
+            scaled = full.modulation_codes()
+            self.assertTrue(
+                torch.allclose(scaled, full.codes.detach() * 0.1, atol=1e-7)
+            )
+
     def test_ablation_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             images, labels, indices = make_dataset()
@@ -168,6 +191,25 @@ class TestSynSet(unittest.TestCase):
             self.assertEqual(
                 shared.p_modulation_total,
                 sum(p.numel() for p in shared.renderer.modulation.parameters()),
+            )
+
+    def test_stage1_checkpoint_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images, labels, indices = make_dataset()
+            messages = []
+            first = make_synset(
+                tmp, stage1_steps=2,
+                logger=lambda msg: messages.append(str(msg)),
+            )
+            first.initialize_from_dataset(images, labels, indices)
+            messages.clear()
+            second = make_synset(
+                tmp, stage1_steps=2,
+                logger=lambda msg: messages.append(str(msg)),
+            )
+            second.initialize_from_dataset(images, labels, indices)
+            self.assertTrue(
+                any("loaded compatible checkpoint" in msg for msg in messages)
             )
 
     def test_save_load(self):

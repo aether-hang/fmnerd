@@ -16,5 +16,5 @@ CUDA_VISIBLE_DEVICES=${cuda_id} python main_TM_FMNeRD.py \
 --data_path ${data_path} --buffer_path ${buffer_path} --save_path ${save_path} \
 --batch_syn 0 --Iteration 100 --eval_it 100 --num_eval 1 \
 --epoch_eval_train 100 \
---msz_per_channel 64 --stage1_steps 100 \
+--msz_per_channel 16 --stage1_steps 100 \
 --FLAG val

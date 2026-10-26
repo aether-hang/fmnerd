@@ -35,9 +35,15 @@ M_c        = top-k(EVR_c),  msz_per_channel 个 (h,w)
 ### 1.2 每实例频率码（FreD）
 
 从真实训练集中为每个类抽取 `num_per_class` 张图片，计算
-`f_i = DCT(x_i)[\mathcal{M}_c]`，存成可学习向量 `f_i ∈ R^k`，
-初始化时乘以 `--code_init_scale`（默认 `0.1`）。实现位置：
-`fmnerd/synset.py::initialize_from_dataset`。
+`f_i = DCT(x_i)[\mathcal{M}_c]`，存成可学习向量 `f_i ∈ R^k`。
+`f_i` 的初值保留**真实 top-k DCT 幅值**（`--code_init_scale 1.0`），
+这样 `L_freq` 对齐的是正确的绝对频率尺度；若需要让 Stage 2 初期的调制
+更小，使用独立的 `--modulation_code_scale 0.1`，它只作用于
+`phi_i=V_c f_i`，不会改变频率对齐目标。实现位置：
+`fmnerd/synset.py::initialize_from_dataset` 与 `modulation_codes()`。
+
+> 早期版本把 0.1 同时乘在 `f_i` 和 `L_freq` 目标上，等于要求解码图像的
+> 低频幅度只有真实值的 10%，会严重破坏图像均值/颜色并拖低准确率。
 
 ### 1.3 类共享 SIREN 骨干（DDiF）
 
@@ -147,6 +153,14 @@ fmnerd-python/
 │   └── scripts/
 ├── DM/                    # DDiF DM 训练循环（feature mean matching）
 ├── DC/                    # DDiF DC 训练循环（gradient matching）
+├── scripts/               # 数据集级统一脚本（推荐入口）
+│   ├── run_experiment.sh  # DATASET/METHOD/IPC 环境变量驱动
+│   ├── run_cifar10.sh
+│   ├── run_cifar100.sh
+│   ├── run_imagenet_nette.sh
+│   ├── run_imagenet_woof.sh
+│   └── run_buffer*.sh
+├── HYPERPARAMS.md         # 各数据集/IPC 推荐超参数与预算表
 ├── tests/                 # CPU 单元测试 + 三个入口的端到端 smoke test
 └── logs/                  # smoke run 的完整日志与 metrics.jsonl
 ```
@@ -210,7 +224,8 @@ used    = num_classes * P_SIREN
 
 辅助超参：`--lambda_freq_start/target`、`--freq_warmup`、
 `--lambda_div`、`--div_tau`、`--lr_code`、`--lr_siren`、
-`--lr_siren_late_scale`、`--code_init_scale`、`--vc_init_std`。
+`--lr_siren_late_scale`、`--code_init_scale`、`--modulation_code_scale`、
+`--vc_init_std`。
 
 示例：
 
@@ -250,36 +265,50 @@ python -m unittest tests.test_fmnerd tests.test_integration -v
 `tests/run_smoke.sh` 使用内置的 `Synthetic` 数据集（4 类、32×32、无下载），
 生成 `logs/` 下的完整诊断日志。
 
-### 6.2 ImageNet-Subset（Nette/Woof）IPC=1，128×128
+### 6.2 推荐：统一数据集脚本（无需改脚本）
 
-目录约定与 DDiF/FreD 一致：
+CIFAR-10 / CIFAR-100 / ImageNet-Nette / ImageNet-Woof 的参数已经内置，
+只需通过环境变量切换：
+
+```bash
+bash scripts/run_buffer_cifar10.sh          # TM 的 expert buffer
+bash scripts/run_buffer_cifar100.sh
+bash scripts/run_buffer_imagenet_nette.sh
+bash scripts/run_buffer_imagenet_woof.sh
+
+bash scripts/run_cifar10.sh TM
+bash scripts/run_cifar10.sh DM
+bash scripts/run_cifar10.sh DC
+
+bash scripts/run_cifar100.sh TM
+bash scripts/run_imagenet_nette.sh TM
+bash scripts/run_imagenet_woof.sh DM
+```
+
+所有环境变量、自动选择的 `msz_per_channel`、推荐超参数表和消融命令见
+[`HYPERPARAMS.md`](HYPERPARAMS.md)。核心用法：
+
+```bash
+METHOD=TM DATASET=CIFAR10 IPC=1 bash scripts/run_experiment.sh
+METHOD=DM DATASET=CIFAR100 IPC=10 bash scripts/run_experiment.sh
+METHOD=TM DATASET=ImageNet SUBSET=nette bash scripts/run_experiment.sh
+DRY_RUN=1 METHOD=DC DATASET=CIFAR10 bash scripts/run_experiment.sh
+```
+
+目录约定：
 
 ```text
-data/imagenet/imagenette/{train,val}/<wnid>/*.JPEG   # 或完整 ImageNet-1k 根目录
+data/cifar-10-batches-py/...                       # CIFAR-10/100
+data/imagenet/imagenette/{train,val}/<wnid>/*.JPEG
+data/imagenet/imagewoof/{train,val}/<wnid>/*.JPEG
+buffers/<dataset>_NO_ZCA/ConvNetD3/replay_buffer_*.pt
 buffers/ImageNet/imagenette_NO_ZCA/ConvNetD5/replay_buffer_*.pt
 ```
 
-```bash
-# 1) MTT expert buffer（TM 需要；DM/DC 不需要）
-cd TM/scripts
-bash run_buffer_ImageNet.sh
+### 6.3 旧的单方法脚本
 
-# 2) 主方法
-bash run_TM_FMNeRD_ImageNet.sh
-# 或
-cd ../../DM/scripts && bash run_DM_FMNeRD_ImageNet.sh
-cd ../../DC/scripts && bash run_DC_FMNeRD_ImageNet.sh
-```
-
-脚本默认 `--save_path ../logs`，因此运行目录会出现在项目根的 `logs/` 下。
-
-### 6.3 CIFAR-10
-
-```bash
-cd TM/scripts && bash run_buffer_cifar10.sh
-bash run_TM_FMNeRD_CIFAR10_val.sh   # 小规模 sanity run
-bash run_TM_FMNeRD.sh               # 正式设置
-```
+`TM/scripts`、`DM/scripts`、`DC/scripts` 中仍保留 DDiF 风格的独立脚本，
+适合只跑单一设置；日常实验建议使用上面的统一脚本。
 
 ---
 

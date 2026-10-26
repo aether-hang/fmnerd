@@ -11,10 +11,17 @@ shift modulation.
 bash tests/run_smoke.sh
 python -m unittest tests.test_fmnerd tests.test_integration -v
 
-# ImageNet-Subset IPC=1 (after preparing data and MTT buffers)
-cd TM/scripts && bash run_buffer_ImageNet.sh
-bash run_TM_FMNeRD_ImageNet.sh
+# CIFAR-10 / CIFAR-100 / ImageNet-Subset, no script editing
+bash scripts/run_buffer_cifar10.sh
+bash scripts/run_cifar10.sh TM
+bash scripts/run_cifar100.sh DM
+bash scripts/run_buffer_imagenet_nette.sh
+bash scripts/run_imagenet_nette.sh TM
+bash scripts/run_imagenet_woof.sh DC
 ```
+
+推荐超参数、IPC 自动配置和消融命令见
+[`HYPERPARAMS.md`](HYPERPARAMS.md)。
 
 方法要点：
 

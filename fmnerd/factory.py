@@ -32,6 +32,7 @@ def build_synset(
         vc_shared=args.vc_shared,
         dipc=args.dipc,
         code_init_scale=args.code_init_scale,
+        modulation_code_scale=args.modulation_code_scale,
         stage1_steps=args.stage1_steps,
         stage1_lr=args.stage1_lr,
         stage1_ckpt=args.stage1_ckpt,

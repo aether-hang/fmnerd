@@ -100,7 +100,10 @@ def add_fmnerd_args(parser):
                    help="share one V across all classes (ablation)")
     g.add_argument("--dipc", type=int, default=0,
                    help="decoded images per class; 0 = fill remaining budget")
-    g.add_argument("--code_init_scale", type=float, default=0.1)
+    g.add_argument("--code_init_scale", type=float, default=1.0,
+                   help="scale applied to the stored top-k DCT target")
+    g.add_argument("--modulation_code_scale", type=float, default=0.1,
+                   help="separate scale of f when forming phi=V_c f")
 
     g.add_argument("--stage1_steps", type=int, default=2000)
     g.add_argument("--stage1_lr", type=float, default=5e-4)
