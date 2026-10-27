@@ -1,5 +1,5 @@
 """FM-NeRD: class-shared SIREN + per-instance FreD top-k frequency codes.
-
+author: aether
 The module owns the *parameterisation* only.  The trajectory-matching (TM),
 distribution-matching (DM) and gradient-matching (DC) loops live in the
 method folders and call :meth:`get`, :meth:`auxiliary_losses`,

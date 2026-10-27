@@ -1,4 +1,6 @@
-"""Construction helpers shared by the three distillation entry points."""
+"""Construction helpers shared by the three distillation entry points.
+author: aether
+"""
 
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# author: aether
 cd ..
 cuda_id=0
 dst="CIFAR10"

@@ -1,5 +1,5 @@
 """Distribution matching (DM) with the FM-NeRD parameterisation.
-
+author: aether
 The class-conditional feature-mean matching loss and evaluation protocol are
 copied from DDiF ``DM/main_DM.py``.  The synthetic images are decoded by the
 class-shared SIREN + per-instance modulation.

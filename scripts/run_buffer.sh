@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# author: aether
 # Build DDiF/MTT expert trajectories for TM.
 #
 # Usage:

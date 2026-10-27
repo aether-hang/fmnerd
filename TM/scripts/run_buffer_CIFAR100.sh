@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DDiF/MTT expert buffer for CIFAR-100 (T4 16GB profile).
+# author: aether
 set -e
 cd "$(dirname "$0")/.."
 cuda_id=${CUDA_ID:-0}

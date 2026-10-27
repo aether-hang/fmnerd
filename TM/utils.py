@@ -1,3 +1,4 @@
+# author: aether
 # adapted from
 # https://github.com/VICO-UoE/DatasetCondensation
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# author: aether
 # Usage: bash scripts/run_cifar100.sh [TM|DM|DC] [extra FM-NeRD args...]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

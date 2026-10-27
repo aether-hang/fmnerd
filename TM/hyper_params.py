@@ -1,5 +1,5 @@
 """Default hyper-parameters copied from DDiF (``TM/hyper_params.py``).
-
+author: aether
 Only the SIREN width / frequency values are taken from DDiF's
 ImageNet-Subset IPC=1 configuration; the distillation loop defaults are the
 official DDiF ones.

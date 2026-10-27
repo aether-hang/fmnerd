@@ -1,5 +1,5 @@
 """FreD-style frequency analysis, EVR masks and top-k frequency codes.
-
+author: aether
 Two pieces are reused from FreD (``TM/main_TM_FreD.py`` and friends):
 
 * the per-class explained-variance-ratio (EVR) mask.  FreD computes the

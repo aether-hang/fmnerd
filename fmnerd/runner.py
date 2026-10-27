@@ -1,4 +1,6 @@
-"""Runtime helpers shared by the TM / DM / DC entry points."""
+"""Runtime helpers shared by the TM / DM / DC entry points.
+author: aether
+"""
 
 from __future__ import annotations
 

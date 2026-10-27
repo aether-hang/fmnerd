@@ -1,5 +1,5 @@
 """Gradient matching (DC) with the FM-NeRD parameterisation.
-
+author: aether
 The outer/inner loop, gradient-matching metric and evaluation protocol are
 copied from DDiF ``DC/main_DC.py``.
 """

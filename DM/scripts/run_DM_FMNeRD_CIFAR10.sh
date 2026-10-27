@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# DM FM-NeRD on CIFAR10, IPC=10.
-# T4 16GB profile: single GPU per process; use CUDA_ID=0/1 to run two jobs in parallel.
+# author: aether
 set -e
 cd "$(dirname "$0")/.."
 cuda_id=${CUDA_ID:-1}

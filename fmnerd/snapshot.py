@@ -1,4 +1,6 @@
-"""Checkpoint and image-grid saving."""
+"""Checkpoint and image-grid saving.
+author: aether
+"""
 
 from __future__ import annotations
 

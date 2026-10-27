@@ -1,5 +1,5 @@
 """Class-shared SIREN backbone with per-instance shift modulation.
-
+author: aether
 Architecture (one backbone per class ``c``)::
 
     h0 = coords                                    # [-1, 1]^2, DDiF convention

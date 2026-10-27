@@ -1,5 +1,5 @@
 """Orthonormal 2-D DCT / IDCT with cached transform matrices.
-
+author: aether
 The transform is the orthonormal DCT-II (``norm='ortho'``).  For an ``N x N``
 matrix ``T`` with
 

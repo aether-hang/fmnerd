@@ -1,4 +1,6 @@
-"""Shared argparse helpers for the TM / DM / DC entry points."""
+"""Shared argparse helpers for the TM / DM / DC entry points.
+author: aether
+"""
 
 from __future__ import annotations
 

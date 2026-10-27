@@ -1,5 +1,5 @@
 """Trajectory matching (MTT/TM) with the FM-NeRD parameterisation.
-
+# author: aether
 The outer/inner training loop, DSA augmentation, ReparamModule teacher and
 evaluation protocol are the DDiF ``TM/main_TM.py`` implementation.  Only the
 synthetic-data module is replaced by ``fmnerd.FMNeRD``.

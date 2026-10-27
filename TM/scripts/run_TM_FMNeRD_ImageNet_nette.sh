@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# TM FM-NeRD on ImageNet/nette, IPC=10.
-# T4 16GB profile: single GPU per process; use CUDA_ID=0/1 to run two jobs in parallel.
-set -e
+# author: aether
 cd "$(dirname "$0")/.."
 cuda_id=${CUDA_ID:-0}
 PYTHON=${PYTHON:-python}

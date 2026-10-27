@@ -1,5 +1,5 @@
 """Load the DDiF-derived defaults from ``TM/hyper_params.py``.
-
+author: aether
 Using an explicit module spec avoids a name collision when a method folder has
 its own ``hyper_params.py`` on ``sys.path``.
 """

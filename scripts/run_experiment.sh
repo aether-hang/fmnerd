@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# author: aether
 # Unified FM-NeRD launcher.
 #
 # Examples:
